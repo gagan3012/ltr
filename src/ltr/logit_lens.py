@@ -233,7 +233,7 @@ def trace_token_evolution(
         _ = model(**inputs)
         
         # For each position in the sequence
-        for pos in range(n_tokens - 1):  # Exclude last token
+        for pos in range(n_tokens):  # Exclude last token
             # For each layer
             for layer_idx, layer in enumerate(range(start_layer, n_layers)):
                 layer_pattern = resid_patterns[layer_idx]
