@@ -288,29 +288,186 @@ def example_4_hallucination_intervention():
     return intervention_results
 
 
-def visualize_results(results, title="Patchscope Analysis"):
-    """Create visualizations of the analysis results."""
-    print(f"\nCreating visualizations for: {title}")
+def visualize_results(results, title="Patchscope Analysis", prompt="", save_path=None):
+    """Create enhanced visualizations of the analysis results.
 
-    # Entity trajectory plot
+    Args:
+        results: The analysis results dictionary
+        title: The title for the visualization
+        prompt: The original prompt used to generate the results
+        save_path: Optional path to save figures as PNG files
+    """
+    print(f"\nCreating enhanced visualizations for: {title}")
+
+    # Set a consistent, color-blind friendly palette
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    # 1. Enhanced Entity Trajectory Plot
     if results["entity_traces"]:
-        plt.figure(figsize=(12, 8))
+        fig, ax = plt.subplots(figsize=(14, 10))
 
+        # Plot a significance threshold
+        ax.axhline(
+            y=0.1,
+            color="gray",
+            linestyle="--",
+            alpha=0.5,
+            label="Significance threshold",
+        )
+
+        # Sort entities by max probability for better legend ordering
+        entity_max_probs = {}
         for entity, trajectory in results["entity_traces"].items():
+            if trajectory:
+                entity_max_probs[entity] = max(
+                    step["probability"] for step in trajectory
+                )
+
+        # Plot entities in order of maximum probability
+        for i, (entity, _) in enumerate(
+            sorted(entity_max_probs.items(), key=lambda x: x[1], reverse=True)
+        ):
+            trajectory = results["entity_traces"][entity]
             if trajectory:
                 steps = [step["step"] for step in trajectory]
                 probs = [step["probability"] for step in trajectory]
-                plt.plot(steps, probs, marker="o", label=entity, linewidth=2)
+                color = colors[i % len(colors)]
+                line = ax.plot(
+                    steps,
+                    probs,
+                    marker="o",
+                    label=entity,
+                    linewidth=3,
+                    markersize=8,
+                    color=color,
+                    alpha=0.8,
+                )
 
-        plt.xlabel("Generation Step")
-        plt.ylabel("Entity Probability")
-        plt.title(f"{title} - Entity Trajectories")
-        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-        plt.grid(True, alpha=0.3)
+                # Annotate maximum probability point
+                max_idx = probs.index(max(probs))
+                ax.annotate(
+                    f"{probs[max_idx]:.3f}",
+                    xy=(steps[max_idx], probs[max_idx]),
+                    xytext=(10, 5),
+                    textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
+                )
+
+                # Annotate final probability
+                if steps[-1] == max(steps):
+                    ax.annotate(
+                        f"{entity}: {probs[-1]:.3f}",
+                        xy=(steps[-1], probs[-1]),
+                        xytext=(15, 0),
+                        textcoords="offset points",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
+                    )
+
+        # Add context information
+        generation = results.get("generated_text", "")
+        context_text = f'Prompt: "{prompt}"\nGeneration: "{generation}"'
+        ax.text(
+            0.01,
+            0.01,
+            context_text,
+            transform=ax.transAxes,
+            fontsize=11,
+            bbox=dict(boxstyle="round,pad=0.5", fc="whitesmoke", alpha=0.8),
+        )
+
+        # Enhance grid and formatting
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+        ax.set_xlabel("Generation Step", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Entity Probability", fontsize=14, fontweight="bold")
+        ax.set_title(
+            f"{title} - Entity Probability Trajectories",
+            fontsize=16,
+            fontweight="bold",
+            pad=20,
+        )
+
+        # Add generated tokens as x-tick labels if available
+        if results.get("generation_trace"):
+            token_labels = []
+            for step_data in results["generation_trace"]:
+                if (
+                    "next_token_info" in step_data
+                    and "token" in step_data["next_token_info"]
+                ):
+                    token = step_data["next_token_info"]["token"]
+                    token_labels.append(f"{step_data['step']}: '{token}'")
+                else:
+                    token_labels.append(str(step_data.get("step", "")))
+
+            # Only use token labels if we have a reasonable number
+            if len(token_labels) <= 25:
+                plt.xticks(
+                    range(len(token_labels)), token_labels, rotation=45, ha="right"
+                )
+
+        # Better legend placement and formatting
+        legend = ax.legend(
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            fontsize=12,
+            title="Tracked Entities",
+            title_fontsize=13,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        # Add summary statistics as text
+        stats_text = "Summary Statistics:\n"
+        for entity, prob_max in sorted(
+            entity_max_probs.items(), key=lambda x: x[1], reverse=True
+        )[:5]:
+            stats_text += f"- {entity}: max={prob_max:.4f}\n"
+
+        # Add key insights if available
+        if "summary" in results and "key_insights" in results["summary"]:
+            stats_text += "\nKey Insights:\n"
+            insights = results["summary"]["key_insights"]
+            if isinstance(insights, list):
+                for insight in insights[:3]:  # Top 3 insights
+                    stats_text += f"- {insight}\n"
+            else:
+                stats_text += f"- {insights}\n"
+
+        # Add the stats text box
+        props = dict(boxstyle="round", facecolor="wheat", alpha=0.4)
+        ax.text(
+            0.01,
+            0.99,
+            stats_text,
+            transform=ax.transAxes,
+            fontsize=11,
+            va="top",
+            bbox=props,
+        )
+
         plt.tight_layout()
+
+        # Save figure if path provided
+        if save_path:
+            fig_path = f"{save_path}_entity_trajectories.png"
+            plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+            print(f"Entity trajectory plot saved to: {fig_path}")
+
         plt.show()
 
-    # Attention patterns heatmap (if available)
+    # 2. Enhanced Attention Patterns Heatmap
     attention_data = []
     for step in results["generation_trace"]:
         for layer_idx, layer_data in step["layer_activations"].items():
@@ -327,12 +484,248 @@ def visualize_results(results, title="Patchscope Analysis"):
         df = pd.DataFrame(attention_data)
         pivot_df = df.pivot(index="layer", columns="step", values="attention_sum")
 
-        plt.figure(figsize=(12, 6))
-        sns.heatmap(pivot_df, cmap="viridis", cbar_kws={"label": "Attention Sum"})
-        plt.title(f"{title} - Attention Patterns by Layer and Step")
-        plt.ylabel("Layer")
-        plt.xlabel("Generation Step")
+        fig, ax = plt.subplots(figsize=(16, 8))
+
+        # Create enhanced heatmap
+        heatmap = sns.heatmap(
+            pivot_df,
+            cmap="viridis",
+            cbar_kws={"label": "Attention Sum", "shrink": 0.8},
+            annot=True,  # Show values in cells
+            fmt=".2f",  # Format for annotations
+            linewidths=0.5,
+            ax=ax,
+        )
+
+        # Get generated tokens if available for x-axis labels
+        token_labels = []
+        if results.get("generation_trace"):
+            for i in range(len(results["generation_trace"])):
+                if i < len(results["generation_trace"]):
+                    step_data = results["generation_trace"][i]
+                    if (
+                        "next_token_info" in step_data
+                        and "token" in step_data["next_token_info"]
+                    ):
+                        token = step_data["next_token_info"]["token"]
+                        token_labels.append(f"{i}: '{token}'")
+
+        if token_labels:
+            ax.set_xticklabels(token_labels, rotation=45, ha="right")
+
+        # Enhance the plot
+        ax.set_title(
+            f"{title} - Attention Patterns by Layer and Generation Step",
+            fontsize=16,
+            fontweight="bold",
+        )
+        ax.set_ylabel("Model Layer", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Generation Step", fontsize=14, fontweight="bold")
+
+        # Add context information
+        generation = results.get("generated_text", "")
+        context_text = f'Prompt: "{prompt}"\nGeneration: "{generation}"'
+        ax.text(
+            0.01,
+            0.01,
+            context_text,
+            transform=ax.transAxes,
+            fontsize=11,
+            bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.8),
+        )
+
+        # Highlight high attention regions
+        if not pivot_df.empty:
+            max_attention = pivot_df.max().max()
+            threshold = max_attention * 0.8
+
+            # Find coordinates of high attention points
+            for layer in pivot_df.index:
+                for step in pivot_df.columns:
+                    val = pivot_df.loc[layer, step]
+                    if val >= threshold:
+                        ax.add_patch(
+                            plt.Rectangle(
+                                (step - 0.5, layer - 0.5),
+                                1,
+                                1,
+                                fill=False,
+                                edgecolor="red",
+                                linewidth=2,
+                            )
+                        )
+
         plt.tight_layout()
+
+        # Save figure if path provided
+        if save_path:
+            fig_path = f"{save_path}_attention_heatmap.png"
+            plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+            print(f"Attention heatmap saved to: {fig_path}")
+
+        plt.show()
+
+    # 3. NEW: Entity Probability Bar Chart (final state)
+    if results["entity_traces"]:
+        # Get final probabilities for each entity
+        final_probs = {}
+        for entity, trajectory in results["entity_traces"].items():
+            if trajectory:
+                final_probs[entity] = trajectory[-1]["probability"]
+
+        if final_probs:
+            fig, ax = plt.subplots(figsize=(12, 8))
+
+            # Sort entities by final probability
+            sorted_entities = sorted(
+                final_probs.items(), key=lambda x: x[1], reverse=True
+            )
+            entities = [item[0] for item in sorted_entities]
+            probabilities = [item[1] for item in sorted_entities]
+
+            # Create bar chart with custom colors
+            bars = ax.bar(entities, probabilities, color=colors[: len(entities)])
+
+            # Add value labels on top of bars
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate(
+                    f"{height:.3f}",
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),  # 3 points vertical offset
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=11,
+                )
+
+            # Add a threshold line
+            ax.axhline(
+                y=0.1,
+                color="red",
+                linestyle="--",
+                alpha=0.7,
+                label="Significance threshold",
+            )
+
+            # Enhance the plot
+            ax.set_xlabel("Entity", fontsize=14, fontweight="bold")
+            ax.set_ylabel("Final Probability", fontsize=14, fontweight="bold")
+            ax.set_title(
+                f"{title} - Final Entity Probabilities", fontsize=16, fontweight="bold"
+            )
+            ax.grid(axis="y", linestyle="--", alpha=0.7)
+
+            # Add context
+            generation = results.get("generated_text", "")
+            context_text = f'Prompt: "{prompt}"\nGeneration: "{generation}"'
+            ax.text(
+                0.01,
+                0.01,
+                context_text,
+                transform=ax.transAxes,
+                fontsize=11,
+                bbox=dict(boxstyle="round,pad=0.5", fc="whitesmoke", alpha=0.8),
+            )
+
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            # Save figure if path provided
+            if save_path:
+                fig_path = f"{save_path}_final_probabilities.png"
+                plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+                print(f"Final probabilities chart saved to: {fig_path}")
+
+            plt.show()
+
+    # 4. NEW: Layer Activation Norms Visualization
+    layer_activations = {}
+    for step in results["generation_trace"]:
+        step_idx = step["step"]
+        for layer_idx, layer_data in step["layer_activations"].items():
+            if "activation_norm" in layer_data:
+                if layer_idx not in layer_activations:
+                    layer_activations[layer_idx] = []
+                while len(layer_activations[layer_idx]) < step_idx:
+                    layer_activations[layer_idx].append(None)
+                layer_activations[layer_idx].append(layer_data["activation_norm"])
+
+    if layer_activations:
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        for i, (layer_idx, norms) in enumerate(sorted(layer_activations.items())):
+            # Filter out None values and create corresponding steps
+            valid_norms = [n for n in norms if n is not None]
+            valid_steps = [idx for idx, n in enumerate(norms) if n is not None]
+
+            color = colors[i % len(colors)]
+            ax.plot(
+                valid_steps,
+                valid_norms,
+                marker="o",
+                label=f"Layer {layer_idx}",
+                linewidth=2.5,
+                markersize=7,
+                color=color,
+                alpha=0.8,
+            )
+
+        # Enhance the plot
+        ax.set_xlabel("Generation Step", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Activation Norm", fontsize=14, fontweight="bold")
+        ax.set_title(
+            f"{title} - Layer Activation Norms", fontsize=16, fontweight="bold"
+        )
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+
+        # Better legend
+        legend = ax.legend(
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            fontsize=12,
+            title="Model Layers",
+            title_fontsize=13,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        # Add generated tokens as x-tick labels if available
+        if results.get("generation_trace") and len(results["generation_trace"]) <= 20:
+            token_labels = []
+            for step_data in results["generation_trace"]:
+                if (
+                    "next_token_info" in step_data
+                    and "token" in step_data["next_token_info"]
+                ):
+                    token = step_data["next_token_info"]["token"]
+                    token_labels.append(f"{step_data['step']}: '{token}'")
+                else:
+                    token_labels.append(str(step_data.get("step", "")))
+
+            plt.xticks(range(len(token_labels)), token_labels, rotation=45, ha="right")
+
+        # Add context
+        generation = results.get("generated_text", "")
+        context_text = f'Prompt: "{prompt}"\nGeneration: "{generation}"'
+        ax.text(
+            0.01,
+            0.01,
+            context_text,
+            transform=ax.transAxes,
+            fontsize=11,
+            bbox=dict(boxstyle="round,pad=0.5", fc="whitesmoke", alpha=0.8),
+        )
+
+        plt.tight_layout()
+
+        # Save figure if path provided
+        if save_path:
+            fig_path = f"{save_path}_layer_activations.png"
+            plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+            print(f"Layer activations plot saved to: {fig_path}")
+
         plt.show()
 
 
@@ -340,22 +733,58 @@ def main():
     """Run all examples and create visualizations."""
     print("LTR Patchscopes Hallucination Analysis Examples")
     print("=" * 60)
+    import os
 
+    viz_dir = "visualization_results"
+    os.makedirs(viz_dir, exist_ok=True)
+    
     # Run examples
     try:
         results1 = example_1_basic_hallucination_detection()
-        visualize_results(results1, "Basic Hallucination Detection")
+        prompt1 = "The capital of Mars is"
+        visualize_results(
+            results1,
+            "Basic Hallucination Detection",
+            prompt1,
+            save_path=os.path.join(viz_dir, "example1"),
+        )
 
         results2 = example_2_comparative_analysis()
+        prompts2 = {
+            "factual": "The capital of France is",
+            "potentially_hallucinated": "The capital of Atlantis is",
+            "mixed": "Einstein discovered relativity in",
+        }
         for prompt_type, results in results2.items():
-            visualize_results(results, f"Comparative Analysis - {prompt_type}")
+            visualize_results(
+                results,
+                f"Comparative Analysis - {prompt_type}",
+                prompts2[prompt_type],
+                save_path=os.path.join(viz_dir, f"example2_{prompt_type}"),
+            )
 
         results3 = example_3_layer_by_layer_analysis()
-        visualize_results(results3, "Layer-by-Layer Analysis")
+        prompt3 = "The first person to walk on Venus was"
+        visualize_results(
+            results3,
+            "Layer-by-Layer Analysis",
+            prompt3,
+            save_path=os.path.join(viz_dir, "example3"),
+        )
 
         results4 = example_4_hallucination_intervention()
+        prompts4 = {
+            "ambiguous": "The author of Harry Potter",
+            "guided_correct": "The author of Harry Potter is J.K. Rowling, who",
+            "guided_incorrect": "The author of Harry Potter is Stephen King, who",
+        }
         for variation, results in results4.items():
-            visualize_results(results, f"Intervention Analysis - {variation}")
+            visualize_results(
+                results,
+                f"Intervention Analysis - {variation}",
+                prompts4[variation],
+                save_path=os.path.join(viz_dir, f"example4_{variation}"),
+            )
 
     except Exception as e:
         print(f"Error running examples: {e}")
