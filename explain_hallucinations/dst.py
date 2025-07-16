@@ -6,7 +6,6 @@ A unified approach to explain why language models hallucinate by:
 2. Generating patched representations to isolate feature drift
 3. Extracting spurious input spans responsible for residual associations
 
-Uses baukit.tracedict for activation tracking and intervention.
 """
 
 import torch
