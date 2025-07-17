@@ -75,13 +75,13 @@ class DistributionalSemanticsTracer:
 
         # Track layer names for baukit tracing
         self.layer_names = [
-            f"{self.layer_prefix}{i}.output" for i in range(self.n_layers)
+            f"{self.layer_prefix}{i}" for i in range(self.n_layers)
         ]
         self.mlp_names = [
-            f"{self.layer_prefix}{i}.mlp.output" for i in range(self.n_layers)
+            f"{self.layer_prefix}{i}.mlp" for i in range(self.n_layers)
         ]
         self.attention_names = [
-            f"{self.layer_prefix}{i}.self_attn.output" for i in range(self.n_layers)
+            f"{self.layer_prefix}{i}.self_attn" for i in range(self.n_layers)
         ]
 
     def _detect_num_layers(self) -> int:
