@@ -75,6 +75,11 @@ from ltr.subsequence_analysis import (
     analyze_hallucination_subsequences
 )
 
+from ltr.dst import (
+    DistributionalSemanticsTracer,
+    DSTResult
+)
+
 # Define public API
 __all__ = [
     # Concept extraction
@@ -120,6 +125,8 @@ __all__ = [
     'animate_concept_activation_diagonal', 'animate_reasoning_flow', 'animate_reasoning_flow_dark',
 
     'SubsequenceAnalyzer', 'analyze_hallucination_subsequences', 'evaluate_subsequence_causality',
+
+    'DistributionalSemanticsTracer', 'DSTResult',
 ]
 
 __version__ = "0.2.0"
