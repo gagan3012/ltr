@@ -12,14 +12,10 @@ tracer = DistributionalSemanticsTracer(model, tokenizer)
 
 # Run analysis with enhanced visualizations
 result = tracer.run_analysis(
-    prompt="Einstein developed nuclear fission in 1905.",
-    factual_prompt="Einstein developed special relativity in 1905.",
-    concept_examples=[
-        "Einstein developed the theory of relativity.",
-        "Einstein is known for E=mc².",
-        "Einstein received the Nobel Prize in Physics.",
-    ],
-    hallucinated_output="nuclear fission",
+    prompt="I am at a concert. I see a bass. Is it a fish? Answer in yes or no:",
+    factual_prompt="I am at a concert. I see a bass. It is a musical instrument.",
+    concept_examples=["instrument", "guitar", "music", "fish", "animal", "concert"],
+    hallucinated_output="yes",  # The incorrect answer (it's not a fish at a concert)
     run_intervention=True,
     enhanced_viz=True,  # Enable enhanced visualizations
 )
@@ -31,7 +27,7 @@ for viz_file in result.semantic_drift_trajectory.get("visualization_files", []):
 
 # Display information about the hallucination
 print("\nHallucination Analysis:")
-print(f"Top spurious spans related to '{hallucinated_output}':")
+print(f"Top spurious spans related to 'yes':")
 for span in result.spurious_spans[:3]:
     print(f" - '{span['text']}' (score: {span['score']:.4f})")
 
