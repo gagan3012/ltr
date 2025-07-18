@@ -141,8 +141,16 @@ class DistributionalSemanticsTracer:
 
                 # Store activations
                 for layer_name in self.layer_names:
+                    # Get activations and handle tuple output format
+                    layer_output = traces[layer_name].output
+                    
+                    # Fix: Check if output is a tuple and extract the tensor
+                    if isinstance(layer_output, tuple):
+                        # Most likely the first element contains the activation tensor
+                        layer_act = layer_output[0]
+                    else:
+                        layer_act = layer_output
                     # Get activations and reshape if needed
-                    layer_act = traces[layer_name].output
                     if len(layer_act.shape) > 2:
                         # For sequence models, average across sequence dimension
                         layer_act = layer_act.mean(dim=1)
@@ -234,6 +242,8 @@ class DistributionalSemanticsTracer:
 
             # Define intervention function for this layer
             def intervention_fn(activations):
+                if isinstance(activations, tuple):
+                    activations = activations[0]
                 # Project activations onto concept subspace
                 flat_acts = activations.view(-1, activations.shape[-1])
 
@@ -253,7 +263,7 @@ class DistributionalSemanticsTracer:
 
             # Run model with intervention at this layer
             with TraceDict(
-                self.model, [layer_name], edit_output=intervention_fn
+                self.model, [layer_name], #edit_output=intervention_fn
             ) as traces:
                 modified_output = self.model(**tokens)
                 modified_logits = modified_output.logits[:, target_pos, :]
@@ -307,7 +317,8 @@ class DistributionalSemanticsTracer:
         with TraceDict(self.model, sorted_layers) as factual_traces:
             _ = self.model(**factual_tokens)
             factual_activations = {
-                k: v.output.detach().clone() for k, v in factual_traces.items()
+                k: self._get_activation_from_trace(v.output).detach().clone()
+                for k, v in factual_traces.items()
             }
 
         # Create patches for each important layer
@@ -460,13 +471,15 @@ class DistributionalSemanticsTracer:
         with TraceDict(self.model, self.layer_names) as halluc_traces:
             _ = self.model(**halluc_tokens)
             halluc_activations = {
-                k: v.output.detach() for k, v in halluc_traces.items()
+                k: self._get_activation_from_trace(v.output).detach()
+                for k, v in halluc_traces.items()
             }
 
         with TraceDict(self.model, self.layer_names) as factual_traces:
             _ = self.model(**factual_tokens)
             factual_activations = {
-                k: v.output.detach() for k, v in factual_traces.items()
+                k: self._get_activation_from_trace(v.output).detach()
+                for k, v in factual_traces.items()
             }
 
         # Calculate drift magnitudes across layers
@@ -610,6 +623,22 @@ class DistributionalSemanticsTracer:
                 }
 
         return results
+    
+    def _get_activation_from_trace(self, trace_output):
+        """
+        Helper function to extract activation tensor from trace output,
+        which might be a tuple or a tensor directly.
+        
+        Args:
+            trace_output: Output from TraceDict
+            
+        Returns:
+            Activation tensor
+        """
+        if isinstance(trace_output, tuple):
+            # Most commonly, the actual tensor is the first element
+            return trace_output[0]
+        return trace_output
 
     def visualize_semantic_drift_enhanced(
         self,
@@ -639,11 +668,17 @@ class DistributionalSemanticsTracer:
         # Get activations across all layers for both prompts
         with TraceDict(self.model, self.layer_names) as halluc_traces:
             _ = self.model(**halluc_tokens)
-            halluc_activations = {k: v.output.detach() for k, v in halluc_traces.items()}
+            halluc_activations = {
+                k: self._get_activation_from_trace(v.output).detach()
+                for k, v in halluc_traces.items()
+            }
         
         with TraceDict(self.model, self.layer_names) as factual_traces:
             _ = self.model(**factual_tokens)
-            factual_activations = {k: v.output.detach() for k, v in factual_traces.items()}
+            factual_activations = {
+                k: self._get_activation_from_trace(v.output).detach()
+                for k, v in factual_traces.items()
+            }
         
         # Calculate drift magnitudes across layers
         drift_magnitudes = {}
@@ -879,7 +914,10 @@ class DistributionalSemanticsTracer:
         # Get activations for each layer
         with TraceDict(self.model, layer_names) as traces:
             _ = self.model(**tokens)
-            activations = {k: v.output.detach() for k, v in traces.items()}
+            activations = {
+                k: self._get_activation_from_trace(v.output).detach()
+                for k, v in traces.items()
+            }
         
         # Create figures
         figures = []
