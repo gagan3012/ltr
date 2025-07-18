@@ -864,7 +864,7 @@ class DistributionalSemanticsTracer:
         prompt: str,
         spurious_spans: List[Dict],
         concept_importance: Dict[str, float],
-        concept_examples: List[str] = None,  # Add parameter to receive concept examples
+        concept_examples: List[str] = None,
         num_layers: int = 4,
         correlation_threshold: float = 0.3,
         figsize=(12, 10)
@@ -878,7 +878,7 @@ class DistributionalSemanticsTracer:
             concept_importance: Dictionary of concept importance scores
             concept_examples: List of concept examples to use in the network (if provided)
             num_layers: Number of layers to visualize
-            correlation_threshold: Minimum correlation to show an edge
+            correlation_threshold: Minimum correlation magnitude to show an edge
             figsize: Figure size
             
         Returns:
@@ -886,32 +886,31 @@ class DistributionalSemanticsTracer:
         """
         import networkx as nx
         from matplotlib.cm import get_cmap
+        from matplotlib.patches import Patch
         
-        # Extract concepts - prioritize provided concept_examples
+        # Use provided concept examples if available, otherwise fall back to default behavior
         if concept_examples and len(concept_examples) >= 2:
-            # Use provided concept examples
             concepts = concept_examples
         else:
-            # Fallback to old behavior - extract from spans and importance scores
+            # Fallback to extracting from spans and importance scores
             concepts = []
             
             # Add top spurious spans as concepts
-            for span in spurious_spans[:3]:  # Use top 3 spans
+            for span in spurious_spans[:3]:
                 if span["text"] not in concepts:
                     concepts.append(span["text"])
             
             # Add top concepts from importance scores
             important_layers = sorted(concept_importance.items(), key=lambda x: x[1], reverse=True)
-            for layer, _ in important_layers[:3]:  # Use top 3 layers
-                layer_name = layer.split('.')[-2]  # Extract layer name
+            for layer, _ in important_layers[:3]:
+                layer_name = layer.split('.')[-2]
                 if layer_name not in concepts:
                     concepts.append(layer_name)
                     
             # Ensure we have at least some concepts
             if len(concepts) < 2:
-                concepts = [prompt.split()[:3], prompt.split()[3:6]]  # Simple fallback
+                concepts = [prompt.split()[:3], prompt.split()[3:6]]
         
-        # Rest of the function remains the same
         # Tokenize the prompt
         tokens = self._encode_text(prompt)
         
@@ -947,6 +946,9 @@ class DistributionalSemanticsTracer:
                 
                 # Create pseudo-concept activations by using token positions
                 concept_activations = {}
+                positive_edges = []
+                negative_edges = []
+                
                 for concept in concepts:
                     # Find all occurrences of concept in tokenized text
                     concept_tokens = self.tokenizer.encode(concept, add_special_tokens=False)
@@ -981,76 +983,132 @@ class DistributionalSemanticsTracer:
                             
                             corr = np.corrcoef(vec1, vec2)[0, 1]
                             
-                            # Only add edge if correlation is significant
+                            # Only add edge if correlation magnitude is significant
                             if abs(corr) >= correlation_threshold:
                                 G.add_edge(concept1, concept2, weight=abs(corr), correlation=corr)
-            
-            # Draw graph
-            if G.number_of_edges() > 0:
-                pos = nx.spring_layout(G, seed=42)
+                                
+                                # Track positive and negative edges separately for visualization
+                                if corr > 0:
+                                    positive_edges.append((concept1, concept2, corr))
+                                else:
+                                    negative_edges.append((concept1, concept2, corr))
                 
-                # Choose colormap based on edge data
-                edge_data = list(G.edges(data=True))
-                any_negative = any(d["correlation"] < 0 for _, _, d in edge_data)
-                
-                if any_negative:
-                    cmap = plt.get_cmap("coolwarm")
-                    norm = plt.Normalize(vmin=-1, vmax=1)
-                    value_fn = lambda r: r
-                else:
-                    cmap = plt.get_cmap("Reds")
-                    norm = plt.Normalize(vmin=correlation_threshold, vmax=1)
-                    value_fn = abs
+                # Draw graph
+                if G.number_of_edges() > 0:
+                    pos = nx.spring_layout(G, seed=42)
                     
-                # Draw nodes
-                nx.draw_networkx_nodes(
-                    G, pos, ax=ax, node_size=1000, 
-                    node_color='lightblue', edgecolors='black', alpha=0.7
-                )
-                
-                # Draw labels
-                nx.draw_networkx_labels(
-                    G, pos, ax=ax, font_size=10, font_weight='bold'
-                )
-                
-                # Draw edges with color based on correlation
-                for u, v, d in G.edges(data=True):
-                    corr = d["correlation"]
-                    color_val = (corr + 1) / 2 if any_negative else abs(corr)
-                    nx.draw_networkx_edges(
-                        G, pos, ax=ax, edgelist=[(u, v)],
-                        width=2 + 3*abs(corr),
-                        alpha=0.7,
-                        edge_color=[cmap(norm(value_fn(corr)))]
+                    # Choose colormap based on edge data
+                    edge_data = list(G.edges(data=True))
+                    any_negative = any(d["correlation"] < 0 for _, _, d in edge_data)
+                    
+                    if any_negative:
+                        # Use diverging colormap for mixed correlations
+                        pos_cmap = plt.get_cmap("Reds")
+                        neg_cmap = plt.get_cmap("Blues")
+                        pos_norm = plt.Normalize(vmin=correlation_threshold, vmax=1)
+                        neg_norm = plt.Normalize(vmin=correlation_threshold, vmax=1)
+                    else:
+                        # Use sequential colormap for only positive correlations
+                        pos_cmap = plt.get_cmap("Reds")
+                        neg_cmap = None
+                        pos_norm = plt.Normalize(vmin=correlation_threshold, vmax=1)
+                        neg_norm = None
+                        
+                    # Draw nodes
+                    nx.draw_networkx_nodes(
+                        G, pos, ax=ax, node_size=1000, 
+                        node_color='lightblue', edgecolors='black', alpha=0.7
                     )
                     
-                # Add colorbar
-                sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-                sm.set_array([])
-                cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.7)
-                cbar.set_label('Correlation', fontsize=10)
+                    # Draw labels
+                    nx.draw_networkx_labels(
+                        G, pos, ax=ax, font_size=10, font_weight='bold'
+                    )
+                    
+                    # Draw positive edges with solid lines
+                    if positive_edges:
+                        for u, v, corr in positive_edges:
+                            nx.draw_networkx_edges(
+                                G, pos, ax=ax, edgelist=[(u, v)],
+                                width=2 + 3*abs(corr),
+                                alpha=0.7,
+                                edge_color=[pos_cmap(pos_norm(corr))],
+                                style='solid'  # Solid lines for positive correlations
+                            )
+                    
+                    # Draw negative edges with dashed lines
+                    if negative_edges:
+                        for u, v, corr in negative_edges:
+                            nx.draw_networkx_edges(
+                                G, pos, ax=ax, edgelist=[(u, v)],
+                                width=2 + 3*abs(corr),
+                                alpha=0.7,
+                                edge_color=[neg_cmap(neg_norm(abs(corr)))],
+                                style='dashed'  # Dashed lines for negative correlations
+                            )
+                    
+                    # Add legend for correlation types
+                    legend_elements = []
+                    if positive_edges:
+                        legend_elements.append(Patch(facecolor=pos_cmap(0.7), 
+                                                    edgecolor='black',
+                                                    label='Positive correlation',
+                                                    alpha=0.7))
+                    if negative_edges:
+                        legend_elements.append(Patch(facecolor=neg_cmap(0.7),
+                                                    edgecolor='black', 
+                                                    label='Negative correlation',
+                                                    alpha=0.7,
+                                                    hatch='//'))
+                    if legend_elements:
+                        ax.legend(handles=legend_elements, loc='upper right')
+                    
+                    # Add colorbars
+                    if any_negative:
+                        # Add two colorbars for positive and negative correlations
+                        pos_sm = plt.cm.ScalarMappable(cmap=pos_cmap, norm=pos_norm)
+                        pos_sm.set_array([])
+                        pos_cbar = plt.colorbar(pos_sm, ax=ax, orientation='vertical', 
+                                            shrink=0.7, pad=0.05, location='left')
+                        pos_cbar.set_label('Positive Correlation', fontsize=10)
+                        
+                        neg_sm = plt.cm.ScalarMappable(cmap=neg_cmap, norm=neg_norm)
+                        neg_sm.set_array([])
+                        neg_cbar = plt.colorbar(neg_sm, ax=ax, orientation='vertical', 
+                                            shrink=0.7, pad=0.05)
+                        neg_cbar.set_label('Negative Correlation', fontsize=10)
+                    else:
+                        # Just one colorbar for positive correlations
+                        pos_sm = plt.cm.ScalarMappable(cmap=pos_cmap, norm=pos_norm)
+                        pos_sm.set_array([])
+                        pos_cbar = plt.colorbar(pos_sm, ax=ax, orientation='vertical', shrink=0.7)
+                        pos_cbar.set_label('Correlation', fontsize=10)
+                    
+                    # Set title with information about negative correlations
+                    if any_negative:
+                        ax.set_title(f"Layer {layer_idx}: Concept Relationship Network\nSolid=positive, Dashed=negative", 
+                                fontsize=12)
+                    else:
+                        ax.set_title(f"Layer {layer_idx}: Concept Relationship Network", fontsize=12)
+                    
+                    # Turn off axis
+                    ax.axis('off')
+                else:
+                    # No significant correlations
+                    ax.text(
+                        0.5, 0.5,
+                        f"No significant concept correlations in Layer {layer_idx}",
+                        ha='center', va='center', fontsize=12
+                    )
+                    ax.axis('off')
                 
-                # Set title
-                ax.set_title(f"Layer {layer_idx}: Concept Relationship Network", fontsize=12)
+                figures.append(fig)
                 
-                # Turn off axis
-                ax.axis('off')
-            else:
-                # No significant correlations
-                ax.text(
-                    0.5, 0.5,
-                    f"No significant concept correlations in Layer {layer_idx}",
-                    ha='center', va='center', fontsize=12
-                )
-                ax.axis('off')
+                # Save each figure
+                fig_path = f"concept_network_layer_{layer_idx}.png"
+                fig.savefig(fig_path)
             
-            figures.append(fig)
-            
-            # Save each figure
-            fig_path = f"concept_network_layer_{layer_idx}.png"
-            fig.savefig(fig_path)
-        
-        return figures
+            return figures
 
     def visualize_activation_distributions(
         self,
