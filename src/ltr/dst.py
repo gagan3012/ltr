@@ -864,6 +864,7 @@ class DistributionalSemanticsTracer:
         prompt: str,
         spurious_spans: List[Dict],
         concept_importance: Dict[str, float],
+        concept_examples: List[str] = None,  # Add parameter to receive concept examples
         num_layers: int = 4,
         correlation_threshold: float = 0.3,
         figsize=(12, 10)
@@ -875,6 +876,7 @@ class DistributionalSemanticsTracer:
             prompt: Input prompt to analyze
             spurious_spans: List of identified spurious spans
             concept_importance: Dictionary of concept importance scores
+            concept_examples: List of concept examples to use in the network (if provided)
             num_layers: Number of layers to visualize
             correlation_threshold: Minimum correlation to show an edge
             figsize: Figure size
@@ -885,25 +887,31 @@ class DistributionalSemanticsTracer:
         import networkx as nx
         from matplotlib.cm import get_cmap
         
-        # Extract concepts from spurious spans and importance scores
-        concepts = []
-        
-        # Add top spurious spans as concepts
-        for span in spurious_spans[:3]:  # Use top 3 spans
-            if span["text"] not in concepts:
-                concepts.append(span["text"])
-        
-        # Add top concepts from importance scores
-        important_layers = sorted(concept_importance.items(), key=lambda x: x[1], reverse=True)
-        for layer, _ in important_layers[:3]:  # Use top 3 layers
-            layer_name = layer.split('.')[-2]  # Extract layer name
-            if layer_name not in concepts:
-                concepts.append(layer_name)
-                
-        # Ensure we have at least some concepts
-        if len(concepts) < 2:
-            concepts = [prompt.split()[:3], prompt.split()[3:6]]  # Simple fallback
+        # Extract concepts - prioritize provided concept_examples
+        if concept_examples and len(concept_examples) >= 2:
+            # Use provided concept examples
+            concepts = concept_examples
+        else:
+            # Fallback to old behavior - extract from spans and importance scores
+            concepts = []
             
+            # Add top spurious spans as concepts
+            for span in spurious_spans[:3]:  # Use top 3 spans
+                if span["text"] not in concepts:
+                    concepts.append(span["text"])
+            
+            # Add top concepts from importance scores
+            important_layers = sorted(concept_importance.items(), key=lambda x: x[1], reverse=True)
+            for layer, _ in important_layers[:3]:  # Use top 3 layers
+                layer_name = layer.split('.')[-2]  # Extract layer name
+                if layer_name not in concepts:
+                    concepts.append(layer_name)
+                    
+            # Ensure we have at least some concepts
+            if len(concepts) < 2:
+                concepts = [prompt.split()[:3], prompt.split()[3:6]]  # Simple fallback
+        
+        # Rest of the function remains the same
         # Tokenize the prompt
         tokens = self._encode_text(prompt)
         
@@ -1276,6 +1284,8 @@ class DistributionalSemanticsTracer:
                 prompt=prompt,
                 spurious_spans=spurious_spans,
                 concept_importance=concept_importance,
+                concept_examples=concept_examples,
+                num_layers=4,
             )
             
             # Create activation distributions visualization
