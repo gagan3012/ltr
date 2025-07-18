@@ -1185,7 +1185,8 @@ class DistributionalSemanticsTracer:
         for c_tokens in concept_tokens:
             with TraceDict(self.model, [mid_layer]) as traces:
                 _ = self.model(**c_tokens)
-                concept_acts.append(traces[mid_layer].output.detach())
+                # concept_acts.append(traces[mid_layer].output.detach())
+                concept_acts.append(self._get_activation_from_trace(traces[mid_layer].output).detach())
         
         # Calculate correlation matrix
         n_concepts = len(concept_examples)
