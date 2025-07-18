@@ -983,7 +983,7 @@ class DistributionalSemanticsTracer:
                             
                             # Only add edge if correlation is significant
                             if abs(corr) >= correlation_threshold:
-                                G.add_edge(concept1, concept2, weight=abs(corr), correlation=corr)
+                                G.add_edge(concept1, concept2, weight=corr, correlation=corr)
             
             # Draw graph
             if G.number_of_edges() > 0:
