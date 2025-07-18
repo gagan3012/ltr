@@ -1076,12 +1076,13 @@ class DistributionalSemanticsTracer:
         # Get activations
         with TraceDict(self.model, layer_names) as halluc_traces:
             _ = self.model(**halluc_tokens)
-            halluc_activations = {k: v.output.detach() for k, v in halluc_traces.items()}
+            # halluc_activations = {k: v.output.detach() for k, v in halluc_traces.items()}
+            halluc_activations = {k: self._get_activation_from_trace(v.output).detach() for k, v in halluc_traces.items()}
         
         with TraceDict(self.model, layer_names) as factual_traces:
             _ = self.model(**factual_tokens)
-            factual_activations = {k: v.output.detach() for k, v in factual_traces.items()}
-        
+            factual_activations = {k: self._get_activation_from_trace(v.output).detach() for k, v in factual_traces.items()}
+
         # Create figure
         fig, axes = plt.subplots(num_layers_to_show, 1, figsize=figsize, sharex=True)
         
