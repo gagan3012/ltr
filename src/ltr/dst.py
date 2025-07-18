@@ -1169,7 +1169,8 @@ class DistributionalSemanticsTracer:
         # Get activations for the prompt
         with TraceDict(self.model, [mid_layer]) as traces:
             _ = self.model(**tokens)
-            prompt_act = traces[mid_layer].output.detach()
+            # prompt_act = traces[mid_layer].output.detach()
+            prompt_act = self._get_activation_from_trace(traces[mid_layer].output).detach()
         
         # Get activations for each concept
         concept_acts = []
