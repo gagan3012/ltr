@@ -1296,6 +1296,7 @@ class DistributionalSemanticsTracer:
         hallucinated_output: str,
         run_intervention: bool = False,
         enhanced_viz: bool = True,
+        num_layers: int = 4
     ) -> DSTResult:
         """
         Run the complete DST analysis pipeline with enhanced visualizations.
@@ -1344,7 +1345,7 @@ class DistributionalSemanticsTracer:
                 spurious_spans=spurious_spans,
                 concept_importance=concept_importance,
                 concept_examples=concept_examples,
-                num_layers=4,
+                num_layers=num_layers,
             )
             
             # Create activation distributions visualization
