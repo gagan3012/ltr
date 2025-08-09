@@ -15,7 +15,8 @@ The codebase addresses three key research questions:
 ### Installation
 
 ```bash
-uv pip install ltr-llm
+uv pip install git+https://github.com/gagan3012/ltr.git
+
 ```
 
 ### Basic DST Analysis
