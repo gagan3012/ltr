@@ -1392,4 +1392,105 @@ class DistributionalSemanticsTracer:
             semantic_drift_trajectory=semantic_drift,
             intervention_results=intervention_results,
         )
+    
+    def compute_dss(
+        self,
+        prompt: str,
+        correct_pathways: List[List[str]],
+        incorrect_pathways: List[List[str]],
+        layer_idx: int = -1,  # Default to final layer
+    ) -> float:
+        """
+        Compute the Distributional Semantics Strength (DSS) metric.
+        
+        Args:
+            prompt: Input prompt to analyze
+            correct_pathways: List of lists representing correct contextual pathways
+                            (e.g., [["forest", "trunk", "tree"], ["park", "trunk", "tree"]])
+            incorrect_pathways: List of lists representing incorrect associative pathways
+                            (e.g., [["car", "trunk", "storage"], ["elephant", "trunk", "nose"]])
+            layer_idx: Layer index to analyze (default: final layer)
+            
+        Returns:
+            DSS score between 0 and 1, where higher values indicate stronger contextual reasoning
+        """
+        # Tokenize prompt
+        tokens = self._encode_text(prompt)
+        
+        # Get all unique concepts from pathways
+        all_concepts = set()
+        for pathway in correct_pathways + incorrect_pathways:
+            all_concepts.update(pathway)
+        
+        # Select the layer to analyze
+        if layer_idx < 0:
+            layer_idx = self.n_layers + layer_idx  # Convert negative index
+        layer_name = self.layer_names[layer_idx]
+        
+        # Get activations for the layer
+        with TraceDict(self.model, [layer_name]) as traces:
+            _ = self.model(**tokens)
+            layer_act = self._get_activation_from_trace(traces[layer_name].output).detach()
+        
+        # Create concept activations dictionary
+        concept_activations = {}
+        for concept in all_concepts:
+            # Find concept tokens in the input
+            concept_tokens = self.tokenizer.encode(concept, add_special_tokens=False)
+            
+            # Look for tokens in the input sequence
+            for i in range(len(tokens.input_ids[0]) - len(concept_tokens) + 1):
+                match = True
+                for j in range(len(concept_tokens)):
+                    if i + j >= len(tokens.input_ids[0]) or tokens.input_ids[0][i + j] != concept_tokens[j]:
+                        match = False
+                        break
+                
+                if match:
+                    # Found the concept, use its activations
+                    concept_activations[concept] = torch.mean(layer_act[0, i:i+len(concept_tokens)], dim=0)
+                    break
+            
+            # If concept not found, use a random position as fallback
+            if concept not in concept_activations:
+                # If concept not found in input, generate activations for it separately
+                concept_tok = self._encode_text(concept)
+                with TraceDict(self.model, [layer_name]) as concept_traces:
+                    _ = self.model(**concept_tok)
+                    concept_act = self._get_activation_from_trace(concept_traces[layer_name].output).detach()
+                    concept_activations[concept] = torch.mean(concept_act[0], dim=0)
+        
+        # Calculate pathway strengths
+        def calculate_pathway_strength(pathway):
+            strength = 0.0
+            count = 0
+            
+            # For each adjacent pair in the pathway
+            for i in range(len(pathway) - 1):
+                concept1 = pathway[i]
+                concept2 = pathway[i + 1]
+                
+                if concept1 in concept_activations and concept2 in concept_activations:
+                    # Calculate correlation between concepts
+                    vec1 = concept_activations[concept1].cpu().numpy()
+                    vec2 = concept_activations[concept2].cpu().numpy()
+                    
+                    # Use absolute correlation as edge strength
+                    corr = abs(np.corrcoef(vec1, vec2)[0, 1])
+                    strength += corr
+                    count += 1
+            
+            # Return strength
+            return strength 
+        
+        # Calculate total strength for correct and incorrect pathways
+        correct_strength = sum([calculate_pathway_strength(p) for p in correct_pathways])
+        incorrect_strength = sum([calculate_pathway_strength(p) for p in incorrect_pathways])
 
+        # Calculate DSS (avoid division by zero)
+        epsilon = 1e-10  # Small value to avoid division by zero
+        dss = correct_strength / (correct_strength + incorrect_strength + epsilon)
+        
+        # Return results
+        return dss
+    

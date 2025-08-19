@@ -10,6 +10,7 @@ Racing_Thoughts/
 SAT/
 Internal_States_Reveal_Hallucination/
 llm_reasoning_tracer/
+colour_emotion/
 
 # Distribution / packaging
 .Python
