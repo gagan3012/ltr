@@ -113,35 +113,47 @@ def extract_concept_activations(
         "activation_grid": {
             concept: np.zeros((n_layers, n_tokens - 1)) for concept in all_concepts
         },
+        "concept_token_info": {},  # Store info about multi-token concepts
     }
 
-    # Get token IDs for all concepts
+    # Get token IDs for all concepts - handle multi-token concepts
     concept_token_ids = {}
     for concept in all_concepts:
         try:
-            # For better compatibility with different tokenizers and to match TransformerLens
-            # We'll try both with space prefix and without
+            # Try both with space prefix and without
             tokens_with_space = tokenizer.encode(
                 " " + concept, add_special_tokens=False
             )
             tokens_without_space = tokenizer.encode(concept, add_special_tokens=False)
 
-            # Choose the one that gives a single token, prefer with space like TransformerLens
-            if len(tokens_with_space) == 1:
-                concept_token_ids[concept] = tokens_with_space[0]
-            elif len(tokens_without_space) == 1:
-                concept_token_ids[concept] = tokens_without_space[0]
+            # Choose the tokenization that gives fewer tokens, prefer with space
+            if (
+                len(tokens_with_space) <= len(tokens_without_space)
+                and len(tokens_with_space) > 0
+            ):
+                concept_tokens = tokens_with_space
             else:
-                logging.warning(
-                    f"Concept '{concept}' maps to multiple tokens. Using first token."
+                concept_tokens = tokens_without_space
+
+            concept_token_ids[concept] = concept_tokens
+
+            # Store information about the tokenization
+            results["concept_token_info"][concept] = {
+                "tokens": concept_tokens,
+                "num_tokens": len(concept_tokens),
+                "token_strings": tokenizer.convert_ids_to_tokens(concept_tokens),
+            }
+
+            if len(concept_tokens) > 1:
+                logging.info(
+                    f"Concept '{concept}' maps to {len(concept_tokens)} tokens: {tokenizer.convert_ids_to_tokens(concept_tokens)}. Will average their activations."
                 )
-                concept_token_ids[concept] = tokens_with_space[0]
+
         except Exception as e:
             logging.warning(f"Failed to encode concept '{concept}': {e}")
             continue
 
     # Set up traces for residual outputs of each layer
-    # This is more equivalent to TransformerLens hook_resid_post
     trace_layers = [layer_pattern.format(i) for i in range(n_layers)]
 
     # Run the model with tracing
@@ -151,13 +163,12 @@ def extract_concept_activations(
         ) as traces:
             outputs = model(**inputs, output_hidden_states=True)
 
-            # Get the output projection matrix - equivalent to W_U in TransformerLens
+            # Get the output projection matrix
             if hasattr(model, "lm_head"):
                 output_weights = model.lm_head.weight
             elif hasattr(model, "cls"):
                 output_weights = model.cls.predictions.decoder.weight
             else:
-                # Last resort - try to get it from the output embeddings
                 if hasattr(model, "get_output_embeddings"):
                     output_weights = model.get_output_embeddings().weight
                 else:
@@ -166,7 +177,6 @@ def extract_concept_activations(
                     )
 
             # Process each layer's hidden states
-            # Use model hidden states if available (more reliable than traced layers)
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 hidden_states = outputs.hidden_states
                 for layer in range(n_layers):
@@ -174,17 +184,28 @@ def extract_concept_activations(
                         layer + 1
                     ]  # +1 to skip the embedding layer
 
-                    # Start from position 1 to skip the first token (same as TransformerLens)
+                    # Start from position 1 to skip the first token
                     for pos in range(1, n_tokens):
-                        # Get the residual vector for this position - matches TransformerLens
+                        # Get the residual vector for this position
                         residual = layer_output[0, pos, :]
 
-                        # Project to the vocabulary space - same as TransformerLens
+                        # Project to the vocabulary space
                         projected_logits = residual @ output_weights.T
 
                         # Check activation for each concept
-                        for concept, concept_id in concept_token_ids.items():
-                            concept_score = projected_logits[concept_id].item()
+                        for concept, concept_tokens in concept_token_ids.items():
+                            if len(concept_tokens) == 1:
+                                # Single token concept - use as before
+                                concept_score = projected_logits[
+                                    concept_tokens[0]
+                                ].item()
+                            else:
+                                # Multi-token concept - average the logits
+                                concept_scores = [
+                                    projected_logits[token_id].item()
+                                    for token_id in concept_tokens
+                                ]
+                                concept_score = np.mean(concept_scores)
 
                             # Store in activation grid
                             results["activation_grid"][concept][layer, pos - 1] = (
@@ -206,23 +227,18 @@ def extract_concept_activations(
                 for layer in range(n_layers):
                     layer_name = layer_pattern.format(layer)
 
-                    # Skip if the layer wasn't traced
                     if layer_name not in traces:
                         logging.warning(
                             f"Layer '{layer_name}' wasn't traced. Skipping."
                         )
                         continue
 
-                    # Get the layer output
                     layer_output = traces[layer_name].output
 
-                    # Standardize shape handling to match TransformerLens
-                    # We want shape to be [batch, sequence, hidden_dim]
+                    # Standardize shape handling
                     if len(layer_output.shape) == 3:  # [batch, seq_len, hidden_dim]
-                        # This is the expected shape
                         pass
                     elif len(layer_output.shape) == 2:  # [seq_len, hidden_dim]
-                        # Add batch dimension
                         layer_output = layer_output.unsqueeze(0)
                     else:
                         logging.warning(
@@ -232,21 +248,28 @@ def extract_concept_activations(
                             hasattr(outputs, "hidden_states")
                             and outputs.hidden_states is not None
                         ):
-                            # Use hidden states as fallback
                             layer_output = outputs.hidden_states[layer + 1]
 
-                    # Start from position 1 to skip the first token (same as TransformerLens)
+                    # Start from position 1 to skip the first token
                     for pos in range(1, n_tokens):
                         try:
-                            # Always access as [0, pos, :] to match TransformerLens
                             residual = layer_output[0, pos, :]
-
-                            # Project to the vocabulary space - same as TransformerLens
                             projected_logits = residual @ output_weights.T
 
                             # Check activation for each concept
-                            for concept, concept_id in concept_token_ids.items():
-                                concept_score = projected_logits[concept_id].item()
+                            for concept, concept_tokens in concept_token_ids.items():
+                                if len(concept_tokens) == 1:
+                                    # Single token concept
+                                    concept_score = projected_logits[
+                                        concept_tokens[0]
+                                    ].item()
+                                else:
+                                    # Multi-token concept - average the logits
+                                    concept_scores = [
+                                        projected_logits[token_id].item()
+                                        for token_id in concept_tokens
+                                    ]
+                                    concept_score = np.mean(concept_scores)
 
                                 # Store in activation grid
                                 results["activation_grid"][concept][layer, pos - 1] = (
@@ -276,7 +299,6 @@ def extract_concept_activations(
             layer_maxes = np.max(results["activation_grid"][concept], axis=1)
             results["layer_max_probs"][concept] = layer_maxes
         else:
-            # Handle concepts that couldn't be encoded
             results["layer_max_probs"][concept] = np.zeros(n_layers)
 
     return results
