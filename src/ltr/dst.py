@@ -122,6 +122,7 @@ class DSTResult:
     cas_trace: CASTrace                      # CAS across depth
     next_token_probs: Dict[str, float]       # word → probability at answer pos
     concept_importance: Dict[int, float]     # layer → aggregate node score
+    generated_text: str = ""                  # greedy continuation from the model
     # Legacy compatibility fields
     patched_representations: Dict[str, Any] = field(default_factory=dict)
     spurious_spans: List[Dict] = field(default_factory=list)
@@ -296,43 +297,78 @@ class DistributionalSemanticsTracer:
     # Step 2: Top-K concept node selection with subword merging
     # ==================================================================
 
-    def _merge_subwords(
+    def _is_subword_continuation(self, token_id: int) -> bool:
+        """
+        Detect whether a vocabulary token is a subword continuation
+        (i.e. never starts a new word).
+
+        Works across BPE (GPT-2 style "Ġ"), SentencePiece ("▁"), and
+        tokenizers that prefix whole-word tokens with a space.
+        """
+        # Use convert_ids_to_tokens to get the raw vocab string before
+        # any detokenization normalisation.
+        raw = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+        if raw is None:
+            return True
+        # Whole-word tokens start with "Ġ" (GPT-2/RoBERTa BPE),
+        # "▁" (SentencePiece/Gemma/Llama), or a leading space.
+        # If none of these are present, the token is a continuation piece.
+        if raw.startswith("Ġ") or raw.startswith("▁") or raw.startswith(" "):
+            return False
+        # Special tokens, single punctuation, digits, etc. are standalone.
+        if len(raw) <= 1 or raw.startswith("<") or raw.startswith("["):
+            return False
+        return True
+
+    def _clean_token_word(self, token_id: int) -> str:
+        """Decode a single token id to a clean surface string."""
+        raw = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+        if raw is None:
+            return ""
+        # Strip SentencePiece / GPT-2 word-boundary markers.
+        return raw.lstrip("Ġ▁ ").strip()
+
+    def _merge_subwords_vocab(
         self,
         token_ids: List[int],
         scores: torch.Tensor,
     ) -> List[Tuple[str, List[int], float]]:
         """
-        Merge adjacent subword tokens that detokenize to the same surface
-        word, aggregating their compatibility scores.
+        Group vocabulary tokens by decoded surface word.
+
+        Unlike sequential-text subword merging, here the token_ids come
+        from an unordered top-K selection over the full vocabulary.
+        Tokens that decode to the same cleaned surface form are merged
+        (scores summed).  Subword continuation pieces that appear without
+        a matching head are kept as standalone entries.
 
         Returns
         -------
         list of (word, [token_ids], aggregated_score)
         """
-        decoded = [self.tokenizer.decode([tid]).strip() for tid in token_ids]
-        merged: List[Tuple[str, List[int], float]] = []
+        word_groups: Dict[str, Tuple[List[int], float]] = {}
+        scores_list = scores.tolist() if isinstance(scores, torch.Tensor) else list(scores)
 
-        for word_str, tid, sc in zip(decoded, token_ids, scores.tolist()):
-            if not word_str:
+        for tid, sc in zip(token_ids, scores_list):
+            word = self._clean_token_word(tid)
+            if not word:
                 continue
-            # Heuristic: many tokenizers prepend "Ġ" / "▁" / " " to mark
-            # word boundaries.  Tokens *without* such a prefix are
-            # continuations of the previous word.
-            is_continuation = not (
-                word_str.startswith("Ġ")
-                or word_str.startswith("▁")
-                or word_str.startswith(" ")
-                or len(merged) == 0
-            )
-            if is_continuation and merged:
-                prev_word, prev_ids, prev_sc = merged[-1]
-                merged[-1] = (
-                    prev_word + word_str,
-                    prev_ids + [tid],
-                    prev_sc + sc,
-                )
+            # Normalise to lower-case for grouping so "The" and "the"
+            # map to the same concept node.
+            key = word.lower()
+            if key in word_groups:
+                existing_ids, existing_sc = word_groups[key]
+                word_groups[key] = (existing_ids + [tid], existing_sc + sc)
             else:
-                merged.append((word_str.lstrip("Ġ▁ "), [tid], sc))
+                word_groups[key] = ([tid], sc)
+
+        # Use the cleanest decoded form as display name
+        merged = []
+        for key, (tids, agg_sc) in word_groups.items():
+            # Pick the surface form from the first (highest-scoring) token
+            display = self._clean_token_word(tids[0])
+            merged.append((display, tids, agg_sc))
+
         return merged
 
     @torch.no_grad()
@@ -345,22 +381,23 @@ class DistributionalSemanticsTracer:
         """
         Eq. (2):  V^ℓ = TopK({s^ℓ(v; i*)}, K)
 
-        With subword merging so nodes correspond to words.
+        With vocabulary-level deduplication so that nodes correspond to
+        distinct human-readable concepts rather than subword fragments.
 
         Parameters
         ----------
         hidden : Tensor (d,)
             Residual stream at the answer position.
         K : int
-            Number of concept nodes.
+            Number of concept nodes to return.
         ensure_tokens : list of int or None
             Token ids that *must* appear in the returned set (gold / foil).
         """
         scores = self.compute_concept_scores(hidden)  # (|V|,)
         U = self._get_unembed_matrix()
 
-        # Retrieve a surplus of top candidates to allow for subword merging
-        n_candidates = min(K * 3, scores.shape[0])
+        # Retrieve a surplus of top candidates to allow for deduplication
+        n_candidates = min(K * 5, scores.shape[0])
         _, topk_ids = torch.topk(scores, n_candidates)
         candidate_ids = topk_ids.tolist()
 
@@ -370,8 +407,10 @@ class DistributionalSemanticsTracer:
                 if tid not in candidate_ids:
                     candidate_ids.append(tid)
 
-        # Merge subwords
-        merged = self._merge_subwords(candidate_ids, scores[candidate_ids])
+        # Group tokens that decode to the same surface word
+        merged = self._merge_subwords_vocab(
+            candidate_ids, scores[candidate_ids]
+        )
         merged.sort(key=lambda x: x[2], reverse=True)
         merged = merged[:K]
 
@@ -585,17 +624,21 @@ class DistributionalSemanticsTracer:
 
         residuals = self._get_residual_stream(tokens, layers)
 
-        # Build ctx / non-ctx token-id sets for matching
+        # Build ctx / non-ctx token-id sets AND word sets for matching
         ctx_ids: Set[int] = set()
+        ctx_words_lower: Set[str] = set()
         for w in context_words:
             ctx_ids.update(
                 self.tokenizer.encode(w, add_special_tokens=False)
             )
+            ctx_words_lower.add(w.lower().strip())
         nonctx_ids: Set[int] = set()
+        nonctx_words_lower: Set[str] = set()
         for w in noncontext_words:
             nonctx_ids.update(
                 self.tokenizer.encode(w, add_special_tokens=False)
             )
+            nonctx_words_lower.add(w.lower().strip())
 
         cas_values: List[float] = []
         for l in layers:
@@ -606,8 +649,10 @@ class DistributionalSemanticsTracer:
             nonctx_score = 0.0
             for n in nodes:
                 tids = set(n.token_ids)
-                is_ctx = bool(tids & ctx_ids)
-                is_nonctx = bool(tids & nonctx_ids)
+                node_word = n.word.lower().strip()
+                # Match by token-id overlap OR word-string match
+                is_ctx = bool(tids & ctx_ids) or node_word in ctx_words_lower
+                is_nonctx = bool(tids & nonctx_ids) or node_word in nonctx_words_lower
                 abs_aff = abs(n.affinity)
                 if is_ctx:
                     ctx_score += abs_aff
@@ -794,6 +839,17 @@ class DistributionalSemanticsTracer:
             word = self.tokenizer.decode([tid]).strip()
             next_token_probs[word] = p
 
+        # ---- Greedy continuation (short) ----
+        gen_ids = self.model.generate(
+            tokens["input_ids"],
+            attention_mask=tokens.get("attention_mask"),
+            max_new_tokens=30,
+            do_sample=False,
+        )
+        generated_text = self.tokenizer.decode(
+            gen_ids[0, seq_len:], skip_special_tokens=True
+        ).strip()
+
         # ---- Concept importance (aggregate score per layer) ----
         concept_importance: Dict[int, float] = {
             l: sum(n.score for n in sm.nodes)
@@ -805,6 +861,7 @@ class DistributionalSemanticsTracer:
             cas_trace=cas_trace,
             next_token_probs=next_token_probs,
             concept_importance=concept_importance,
+            generated_text=generated_text,
         )
 
     # ==================================================================
