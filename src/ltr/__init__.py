@@ -77,7 +77,11 @@ from ltr.subsequence_analysis import (
 
 from ltr.dst import (
     DistributionalSemanticsTracer,
-    DSTResult
+    DSTResult,
+    SemanticMap,
+    SemanticMapNode,
+    SemanticMapEdge,
+    CASTrace,
 )
 
 # Define public API
@@ -127,6 +131,7 @@ __all__ = [
     'SubsequenceAnalyzer', 'analyze_hallucination_subsequences', 'evaluate_subsequence_causality',
 
     'DistributionalSemanticsTracer', 'DSTResult',
+    'SemanticMap', 'SemanticMapNode', 'SemanticMapEdge', 'CASTrace',
 ]
 
 __version__ = "0.2.0"
