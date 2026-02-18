@@ -596,6 +596,28 @@ class DistributionalSemanticsTracer:
     # CAS: Contextual Alignment Score
     # ==================================================================
 
+    def _get_word_embedding(self, word: str) -> torch.Tensor:
+        """
+        Get the embedding vector for a word.
+
+        If the word tokenizes into multiple subword pieces, average
+        their embedding vectors to obtain a single representation.
+
+        Returns
+        -------
+        Tensor of shape (d,)
+        """
+        tids = self.tokenizer.encode(word, add_special_tokens=False)
+        if not tids:
+            # Fallback: try with a space prefix (common for SentencePiece)
+            tids = self.tokenizer.encode(" " + word, add_special_tokens=False)
+        if not tids:
+            raise ValueError(f"Cannot tokenize word: {word!r}")
+
+        U = self._get_unembed_matrix()  # (|V|, d)
+        vecs = U[tids]                  # (n_pieces, d)
+        return vecs.mean(dim=0)         # (d,)
+
     @torch.no_grad()
     def compute_cas(
         self,
@@ -614,53 +636,83 @@ class DistributionalSemanticsTracer:
             CAS^ℓ = Σ_{v ∈ V_ctx} |a^ℓ(v)|
                     / (Σ_{v ∈ V_ctx} |a^ℓ(v)| + Σ_{v ∈ V_nonctx} |a^ℓ(v)|)
 
+        Computes CAS *directly* from the cosine similarity between the
+        residual stream and each context / noncontext word embedding.
+        This does NOT rely on top-K concept selection.
+
         Parameters
         ----------
         context_words    : words compatible with the *intended* interpretation.
         noncontext_words : words compatible with the *competing* interpretation.
+        K : int
+            Unused (kept for API compatibility).
         """
         if layers is None:
             layers = list(range(self.n_layers))
 
         residuals = self._get_residual_stream(tokens, layers)
 
-        # Build ctx / non-ctx token-id sets AND word sets for matching
-        ctx_ids: Set[int] = set()
-        ctx_words_lower: Set[str] = set()
+        # Pre-compute embedding vectors for each word
+        ctx_embeddings: List[torch.Tensor] = []
         for w in context_words:
-            ctx_ids.update(
-                self.tokenizer.encode(w, add_special_tokens=False)
-            )
-            ctx_words_lower.add(w.lower().strip())
-        nonctx_ids: Set[int] = set()
-        nonctx_words_lower: Set[str] = set()
+            try:
+                ctx_embeddings.append(self._get_word_embedding(w))
+            except ValueError:
+                warnings.warn(f"Skipping untokenizable context word: {w!r}")
+
+        nonctx_embeddings: List[torch.Tensor] = []
         for w in noncontext_words:
-            nonctx_ids.update(
-                self.tokenizer.encode(w, add_special_tokens=False)
+            try:
+                nonctx_embeddings.append(self._get_word_embedding(w))
+            except ValueError:
+                warnings.warn(
+                    f"Skipping untokenizable noncontext word: {w!r}"
+                )
+
+        if not ctx_embeddings and not nonctx_embeddings:
+            warnings.warn("No valid context/noncontext embeddings — CAS undefined.")
+            return CASTrace(
+                cas_values=[0.5] * len(layers),
+                onset_layer=None,
+                inversion_layer=None,
+                commitment_layer=None,
             )
-            nonctx_words_lower.add(w.lower().strip())
+
+        # Stack for vectorised cosine similarity
+        # ctx_mat: (n_ctx, d),  nonctx_mat: (n_nonctx, d)
+        ctx_mat = (
+            torch.stack(ctx_embeddings)
+            if ctx_embeddings
+            else torch.zeros(0, self._get_unembed_matrix().shape[1], device=self.device)
+        )
+        nonctx_mat = (
+            torch.stack(nonctx_embeddings)
+            if nonctx_embeddings
+            else torch.zeros(0, self._get_unembed_matrix().shape[1], device=self.device)
+        )
 
         cas_values: List[float] = []
         for l in layers:
             h = residuals[l][0, answer_pos]  # (d,)
-            nodes = self.select_concept_nodes(h, K=K)
+            h_norm = F.normalize(h.unsqueeze(0), dim=-1)  # (1, d)
 
-            ctx_score = 0.0
-            nonctx_score = 0.0
-            for n in nodes:
-                tids = set(n.token_ids)
-                node_word = n.word.lower().strip()
-                # Match by token-id overlap OR word-string match
-                is_ctx = bool(tids & ctx_ids) or node_word in ctx_words_lower
-                is_nonctx = bool(tids & nonctx_ids) or node_word in nonctx_words_lower
-                abs_aff = abs(n.affinity)
-                if is_ctx:
-                    ctx_score += abs_aff
-                if is_nonctx:
-                    nonctx_score += abs_aff
+            # Cosine affinities  a^ℓ(v) = cos(h, e(v))
+            if ctx_mat.shape[0] > 0:
+                ctx_normed = F.normalize(ctx_mat, dim=-1)        # (n_ctx, d)
+                ctx_cos = (h_norm @ ctx_normed.T).squeeze(0)     # (n_ctx,)
+                ctx_score = float(ctx_cos.abs().sum())
+            else:
+                ctx_score = 0.0
+
+            if nonctx_mat.shape[0] > 0:
+                nonctx_normed = F.normalize(nonctx_mat, dim=-1)  # (n_nonctx, d)
+                nonctx_cos = (h_norm @ nonctx_normed.T).squeeze(0)
+                nonctx_score = float(nonctx_cos.abs().sum())
+            else:
+                nonctx_score = 0.0
 
             total = ctx_score + nonctx_score
-            cas = ctx_score / total if total > 0 else 0.5
+            cas = ctx_score / total if total > 0.0 else 0.5
             cas_values.append(cas)
 
         # Derive operational markers
