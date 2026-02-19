@@ -431,6 +431,62 @@ class DistributionalSemanticsTracer:
             )
         return nodes
 
+    @torch.no_grad()
+    def select_concept_nodes_from_words(
+        self,
+        hidden: torch.Tensor,
+        words: List[str],
+    ) -> List[SemanticMapNode]:
+        """
+        Build concept nodes from a *specific* set of words rather than
+        from the top-K vocabulary.
+
+        Each word is tokenized, its concept score is the sum of per-token
+        unembedding scores, and its affinity is the cosine similarity
+        between the residual stream and the (averaged) word embedding.
+
+        Parameters
+        ----------
+        hidden : Tensor (d,)
+            Residual stream at the answer position.
+        words : list of str
+            The exact words to include as concept nodes.
+        """
+        scores = self.compute_concept_scores(hidden)  # (|V|,)
+        U = self._get_unembed_matrix()
+        h_norm = F.normalize(hidden.unsqueeze(0), dim=-1).squeeze(0)
+
+        nodes: List[SemanticMapNode] = []
+        seen: Set[str] = set()
+        for word in words:
+            key = word.lower().strip()
+            if key in seen or not key:
+                continue
+            seen.add(key)
+
+            tids = self.tokenizer.encode(word, add_special_tokens=False)
+            if not tids:
+                # Try with leading space (SentencePiece convention)
+                tids = self.tokenizer.encode(" " + word, add_special_tokens=False)
+            if not tids:
+                continue
+
+            agg_score = float(scores[tids].sum())
+            e_v = U[tids].mean(dim=0)
+            e_v_norm = F.normalize(e_v.unsqueeze(0), dim=-1).squeeze(0)
+            affinity = float(h_norm @ e_v_norm)
+            nodes.append(
+                SemanticMapNode(
+                    word=word,
+                    token_ids=tids,
+                    score=agg_score,
+                    affinity=affinity,
+                )
+            )
+
+        nodes.sort(key=lambda n: n.score, reverse=True)
+        return nodes
+
     # ==================================================================
     # Step 3: Causal edge weights  Ω^ℓ(v ⇒ w)
     # ==================================================================
@@ -558,6 +614,7 @@ class DistributionalSemanticsTracer:
         ensure_tokens: Optional[List[int]] = None,
         corruption_token: Optional[int] = None,
         compute_edges: bool = True,
+        concept_words: Optional[List[str]] = None,
     ) -> SemanticMap:
         """
         Construct the full semantic map G^ℓ for one layer.
@@ -567,20 +624,26 @@ class DistributionalSemanticsTracer:
         tokens : dict          — tokenized prompt
         layer  : int           — layer index
         answer_pos : int       — token position used for prediction
-        K      : int           — number of concept nodes
+        K      : int           — number of concept nodes (used when concept_words is None)
         ensure_tokens : list   — token ids that must appear in the map
         corruption_token : int — token used for minimal corruption
         compute_edges : bool   — whether to compute causal edges (Step 3)
+        concept_words : list of str, optional
+            If provided, nodes are built from *exactly* these words
+            (context + noncontext) instead of top-K vocabulary items.
         """
         residuals = self._get_residual_stream(tokens, [layer])[layer]
         h = residuals[0, answer_pos]  # (d,)
 
-        nodes = self.select_concept_nodes(
-            h, K=K, ensure_tokens=ensure_tokens
-        )
+        if concept_words:
+            nodes = self.select_concept_nodes_from_words(h, concept_words)
+        else:
+            nodes = self.select_concept_nodes(
+                h, K=K, ensure_tokens=ensure_tokens
+            )
 
         edges: List[SemanticMapEdge] = []
-        if compute_edges:
+        if compute_edges and nodes:
             edges = self.compute_causal_edges(
                 tokens,
                 nodes,
@@ -856,6 +919,13 @@ class DistributionalSemanticsTracer:
                 0, self.n_layers - 1, n_maps, dtype=int
             ).tolist()
 
+        # ---- Concept words for semantic maps ----
+        # When context/noncontext words are given, restrict semantic-map
+        # nodes to exactly those words so every node is meaningful.
+        concept_words: Optional[List[str]] = None
+        if context_words or noncontext_words:
+            concept_words = list(context_words or []) + list(noncontext_words or [])
+
         # ---- Build semantic maps ----
         semantic_maps: Dict[int, SemanticMap] = {}
         for l in tqdm(map_layers, desc="Building semantic maps"):
@@ -867,6 +937,7 @@ class DistributionalSemanticsTracer:
                 ensure_tokens=ensure_tokens,
                 corruption_token=corruption_token,
                 compute_edges=compute_edges,
+                concept_words=concept_words,
             )
             semantic_maps[l] = sm
 
