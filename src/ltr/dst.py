@@ -193,10 +193,57 @@ class DistributionalSemanticsTracer:
 
         # Cached unembedding matrix  U ∈ R^{|V| × d}
         self._unembed_weight: Optional[torch.Tensor] = None
+        self._final_norm = self._get_final_norm()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_final_norm(self):
+        """
+        Locate the model's final layer norm (applied before lm_head).
+
+        Supports:
+        - LLaMA / Qwen / Gemma / Mistral: ``model.model.norm``
+        - GPT-2: ``model.transformer.ln_f``
+        - GPT-NeoX: ``model.gpt_neox.final_layer_norm``
+        - Fallback: ``nn.Identity()`` (no-op)
+        """
+        # Try common locations
+        for path in [
+            "model.norm",           # LLaMA, Qwen, Gemma, Mistral
+            "transformer.ln_f",     # GPT-2
+            "gpt_neox.final_layer_norm",  # GPT-NeoX
+            "transformer.norm_f",   # Falcon
+        ]:
+            obj = self.model
+            try:
+                for attr in path.split("."):
+                    obj = getattr(obj, attr)
+                return obj
+            except AttributeError:
+                continue
+        warnings.warn(
+            "Could not find final layer norm — concept scores at "
+            "intermediate layers may be inaccurate."
+        )
+        return torch.nn.Identity()
+
+    @torch.no_grad()
+    def _apply_final_norm(self, hidden: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the model's final layer norm to a hidden state.
+
+        This is essential because the unembedding matrix expects
+        *normalised* residual-stream vectors.  Without this, concept
+        scores and cosine affinities at intermediate layers are
+        near-uniform.
+
+        Parameters
+        ----------
+        hidden : Tensor  — (d,) or (batch, seq, d)
+        """
+        return self._final_norm(hidden)
 
     def _detect_num_layers(self) -> int:
         """Detect the number of transformer layers from model config."""
@@ -291,7 +338,8 @@ class DistributionalSemanticsTracer:
             Compatibility score for every vocabulary item.
         """
         U = self._get_unembed_matrix()  # (|V|, d)
-        return U @ hidden               # (|V|,)
+        h = self._apply_final_norm(hidden)  # project into unembedding space
+        return U @ h                    # (|V|,)
 
     # ==================================================================
     # Step 2: Top-K concept node selection with subword merging
@@ -414,13 +462,14 @@ class DistributionalSemanticsTracer:
         merged.sort(key=lambda x: x[2], reverse=True)
         merged = merged[:K]
 
-        # Build nodes with affinity  a^ℓ(v) = cos(h, e(v))
-        h_norm = F.normalize(hidden.unsqueeze(0), dim=-1).squeeze(0)
+        # Build nodes with affinity  a^ℓ(v) = cos(norm(h), e(v))
+        h_normed = self._apply_final_norm(hidden)
+        h_unit = F.normalize(h_normed.unsqueeze(0), dim=-1).squeeze(0)
         nodes: List[SemanticMapNode] = []
         for word, tids, agg_score in merged:
             e_v = U[tids].mean(dim=0)
             e_v_norm = F.normalize(e_v.unsqueeze(0), dim=-1).squeeze(0)
-            affinity = float(h_norm @ e_v_norm)
+            affinity = float(h_unit @ e_v_norm)
             nodes.append(
                 SemanticMapNode(
                     word=word,
@@ -452,9 +501,10 @@ class DistributionalSemanticsTracer:
         words : list of str
             The exact words to include as concept nodes.
         """
-        scores = self.compute_concept_scores(hidden)  # (|V|,)
+        scores = self.compute_concept_scores(hidden)  # (|V|,)  (norm applied inside)
         U = self._get_unembed_matrix()
-        h_norm = F.normalize(hidden.unsqueeze(0), dim=-1).squeeze(0)
+        h_normed = self._apply_final_norm(hidden)
+        h_unit = F.normalize(h_normed.unsqueeze(0), dim=-1).squeeze(0)
 
         nodes: List[SemanticMapNode] = []
         seen: Set[str] = set()
@@ -474,7 +524,7 @@ class DistributionalSemanticsTracer:
             agg_score = float(scores[tids].sum())
             e_v = U[tids].mean(dim=0)
             e_v_norm = F.normalize(e_v.unsqueeze(0), dim=-1).squeeze(0)
-            affinity = float(h_norm @ e_v_norm)
+            affinity = float(h_unit @ e_v_norm)
             nodes.append(
                 SemanticMapNode(
                     word=word,
@@ -756,10 +806,11 @@ class DistributionalSemanticsTracer:
 
         cas_values: List[float] = []
         for l in layers:
-            h = residuals[l][0, answer_pos]  # (d,)
+            h_raw = residuals[l][0, answer_pos]   # (d,)
+            h = self._apply_final_norm(h_raw)      # project into unembed space
             h_norm = F.normalize(h.unsqueeze(0), dim=-1)  # (1, d)
 
-            # Cosine affinities  a^ℓ(v) = cos(h, e(v))
+            # Cosine affinities  a^ℓ(v) = cos(norm(h), e(v))
             if ctx_mat.shape[0] > 0:
                 ctx_normed = F.normalize(ctx_mat, dim=-1)        # (n_ctx, d)
                 ctx_cos = (h_norm @ ctx_normed.T).squeeze(0)     # (n_ctx,)
