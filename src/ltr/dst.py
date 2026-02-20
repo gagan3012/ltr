@@ -842,24 +842,38 @@ class DistributionalSemanticsTracer:
         )
 
     # ------------------------------------------------------------------
-    # Operational layer markers
+    # Operational layer markers  (probability-based CAS, range [0, 1])
+    #
+    #   CAS > 0.5  →  context (safe) words dominate
+    #   CAS < 0.5  →  noncontext (unsafe) words dominate
+    #   CAS = 0.5  →  neutral
     # ------------------------------------------------------------------
 
     @staticmethod
     def _find_onset(
         cas: List[float],
-        tolerance: float = 0.02,
+        tolerance: float = 0.03,
         window: int = 2,
     ) -> Optional[int]:
         """
         **Prediction onset** (green dot):
-        Earliest layer where CAS begins a sustained decline relative to
-        the immediately preceding layer.
+        Earliest layer where CAS begins a sustained *directional* change
+        (either rising or falling) — the model starts forming a
+        prediction.
+
+        Detected as the first layer where |CAS[i] − CAS[i−1]| exceeds
+        *tolerance* and the direction persists for *window* subsequent
+        layers.
         """
         for i in range(1, len(cas)):
-            if cas[i] < cas[i - 1] - tolerance:
+            delta = cas[i] - cas[i - 1]
+            if abs(delta) > tolerance:
+                # Check that the next `window` layers continue the same direction
+                direction = 1 if delta > 0 else -1
                 sustained = all(
-                    cas[min(i + j, len(cas) - 1)] <= cas[i] + tolerance
+                    (cas[min(i + j, len(cas) - 1)] - cas[min(i + j - 1, len(cas) - 1)])
+                    * direction
+                    >= -tolerance
                     for j in range(1, window + 1)
                 )
                 if sustained:
@@ -869,11 +883,16 @@ class DistributionalSemanticsTracer:
     @staticmethod
     def _find_inversion(
         cas: List[float],
-        threshold: float = 0.8,
+        threshold: float = 0.5,
     ) -> Optional[int]:
         """
         **Semantic inversion** (yellow dot):
-        First layer where CAS falls below a fixed threshold.
+        First layer where CAS crosses *below* 0.5 — the model flips from
+        predicting context words to predicting noncontext words.
+
+        For an aligned model this may never occur (CAS stays above 0.5).
+        For a misaligned model this marks where the unsafe prediction
+        takes over.
         """
         for i, c in enumerate(cas):
             if c < threshold:
@@ -889,15 +908,29 @@ class DistributionalSemanticsTracer:
     ) -> Optional[int]:
         """
         **Commitment** (red dot):
-        First layer after inversion beyond which CAS remains persistently
-        low through the remaining depth.
+        First layer after which CAS stays on a *consistent side* of 0.5
+        through the remaining depth.  If inversion occurred, looks for
+        persistence below *threshold*; otherwise looks for persistence
+        above *threshold*.
+
+        This marks the layer where the model has "locked in" its final
+        prediction direction.
         """
-        if inversion is None:
-            return None
-        for i in range(inversion, len(cas)):
-            if cas[i] < threshold:
+        if inversion is not None:
+            # Model inverted → commitment = stays below threshold
+            for i in range(inversion, len(cas)):
                 remaining = cas[i:]
-                if all(c < threshold for c in remaining[:min_persist]):
+                if len(remaining) >= min_persist and all(
+                    c < threshold for c in remaining[:min_persist]
+                ):
+                    return i
+        else:
+            # Model never inverted → commitment = stays above threshold
+            for i in range(len(cas)):
+                remaining = cas[i:]
+                if len(remaining) >= min_persist and all(
+                    c >= threshold for c in remaining[:min_persist]
+                ):
                     return i
         return None
 
