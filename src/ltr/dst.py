@@ -731,6 +731,18 @@ class DistributionalSemanticsTracer:
         vecs = U[tids]                  # (n_pieces, d)
         return vecs.mean(dim=0)         # (d,)
 
+    def _get_word_token_ids(self, word: str) -> List[int]:
+        """
+        Tokenize a word, returning all subword token IDs.
+
+        Tries the word as-is first, then with a space prefix
+        (needed for SentencePiece tokenizers).
+        """
+        tids = self.tokenizer.encode(word, add_special_tokens=False)
+        if not tids:
+            tids = self.tokenizer.encode(" " + word, add_special_tokens=False)
+        return tids
+
     @torch.no_grad()
     def compute_cas(
         self,
@@ -742,16 +754,18 @@ class DistributionalSemanticsTracer:
         K: int = 30,
     ) -> CASTrace:
         """
-        Eq. (6)–(7):
+        Eq. (6)–(7) — probability-based CAS:
 
-            a^ℓ(v) = cos(h_{i*}^ℓ, e(v))
+            p^ℓ(v) = softmax(U · norm(h^ℓ))_v
 
-            CAS^ℓ = Σ_{v ∈ V_ctx} |a^ℓ(v)|
-                    / (Σ_{v ∈ V_ctx} |a^ℓ(v)| + Σ_{v ∈ V_nonctx} |a^ℓ(v)|)
+            CAS^ℓ = Σ_{v ∈ V_ctx}  p^ℓ(v)
+                    / (Σ_{v ∈ V_ctx} p^ℓ(v) + Σ_{v ∈ V_nonctx} p^ℓ(v))
 
-        Computes CAS *directly* from the cosine similarity between the
-        residual stream and each context / noncontext word embedding.
-        This does NOT rely on top-K concept selection.
+        Uses softmax-normalised logits (like logit lens) so that CAS
+        reflects *prediction direction*, not just information content.
+        This ensures:
+        - An aligned model predicting refusal words → high CAS
+        - A decensored model predicting compliance words → low CAS
 
         Parameters
         ----------
@@ -765,25 +779,27 @@ class DistributionalSemanticsTracer:
 
         residuals = self._get_residual_stream(tokens, layers)
 
-        # Pre-compute embedding vectors for each word
-        ctx_embeddings: List[torch.Tensor] = []
+        # Collect token IDs for context and noncontext words
+        ctx_token_ids: List[int] = []
         for w in context_words:
-            try:
-                ctx_embeddings.append(self._get_word_embedding(w))
-            except ValueError:
+            tids = self._get_word_token_ids(w)
+            if tids:
+                ctx_token_ids.extend(tids)
+            else:
                 warnings.warn(f"Skipping untokenizable context word: {w!r}")
 
-        nonctx_embeddings: List[torch.Tensor] = []
+        nonctx_token_ids: List[int] = []
         for w in noncontext_words:
-            try:
-                nonctx_embeddings.append(self._get_word_embedding(w))
-            except ValueError:
+            tids = self._get_word_token_ids(w)
+            if tids:
+                nonctx_token_ids.extend(tids)
+            else:
                 warnings.warn(
                     f"Skipping untokenizable noncontext word: {w!r}"
                 )
 
-        if not ctx_embeddings and not nonctx_embeddings:
-            warnings.warn("No valid context/noncontext embeddings — CAS undefined.")
+        if not ctx_token_ids and not nonctx_token_ids:
+            warnings.warn("No valid context/noncontext tokens — CAS undefined.")
             return CASTrace(
                 cas_values=[0.5] * len(layers),
                 onset_layer=None,
@@ -791,42 +807,26 @@ class DistributionalSemanticsTracer:
                 commitment_layer=None,
             )
 
-        # Stack for vectorised cosine similarity
-        # ctx_mat: (n_ctx, d),  nonctx_mat: (n_nonctx, d)
-        ctx_mat = (
-            torch.stack(ctx_embeddings)
-            if ctx_embeddings
-            else torch.zeros(0, self._get_unembed_matrix().shape[1], device=self.device)
-        )
-        nonctx_mat = (
-            torch.stack(nonctx_embeddings)
-            if nonctx_embeddings
-            else torch.zeros(0, self._get_unembed_matrix().shape[1], device=self.device)
-        )
+        # Deduplicate while preserving set membership
+        ctx_set = set(ctx_token_ids)
+        nonctx_set = set(nonctx_token_ids) - ctx_set  # ctx takes priority
+
+        U = self._get_unembed_matrix()  # (|V|, d)
 
         cas_values: List[float] = []
-        for l in layers:
-            h_raw = residuals[l][0, answer_pos]   # (d,)
-            h = self._apply_final_norm(h_raw)      # project into unembed space
-            h_norm = F.normalize(h.unsqueeze(0), dim=-1)  # (1, d)
+        for layer_idx in layers:
+            h_raw = residuals[layer_idx][0, answer_pos]  # (d,)
+            h = self._apply_final_norm(h_raw)             # apply RMSNorm
 
-            # Cosine affinities  a^ℓ(v) = cos(norm(h), e(v))
-            if ctx_mat.shape[0] > 0:
-                ctx_normed = F.normalize(ctx_mat, dim=-1)        # (n_ctx, d)
-                ctx_cos = (h_norm @ ctx_normed.T).squeeze(0)     # (n_ctx,)
-                ctx_score = float(ctx_cos.abs().sum())
-            else:
-                ctx_score = 0.0
+            # Full vocabulary logits → softmax probabilities
+            logits = U @ h                                # (|V|,)
+            probs = torch.softmax(logits, dim=0)          # (|V|,)
 
-            if nonctx_mat.shape[0] > 0:
-                nonctx_normed = F.normalize(nonctx_mat, dim=-1)  # (n_nonctx, d)
-                nonctx_cos = (h_norm @ nonctx_normed.T).squeeze(0)
-                nonctx_score = float(nonctx_cos.abs().sum())
-            else:
-                nonctx_score = 0.0
+            ctx_prob = float(probs[list(ctx_set)].sum()) if ctx_set else 0.0
+            nonctx_prob = float(probs[list(nonctx_set)].sum()) if nonctx_set else 0.0
 
-            total = ctx_score + nonctx_score
-            cas = ctx_score / total if total > 0.0 else 0.5
+            total = ctx_prob + nonctx_prob
+            cas = ctx_prob / total if total > 1e-12 else 0.5
             cas_values.append(cas)
 
         # Derive operational markers
