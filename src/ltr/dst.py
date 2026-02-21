@@ -279,8 +279,44 @@ class DistributionalSemanticsTracer:
         self._unembed_weight = W.to(self.device)
         return self._unembed_weight
 
-    def _encode(self, text: str) -> dict:
-        """Tokenize text and move tensors to the model device."""
+    def _format_prompt(self, text: str) -> str:
+        """
+        Format *text* using the tokenizer's chat template when available.
+
+        If the tokenizer exposes ``apply_chat_template``, the prompt is
+        wrapped as a single user message.  Otherwise *text* is returned
+        unchanged.
+        """
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": text}]
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                # Tokenizer has the method but no template — fall back
+                return text
+        return text
+
+    def _encode(
+        self,
+        text: str,
+        *,
+        apply_chat_template: bool = False,
+    ) -> dict:
+        """
+        Tokenize *text* and move tensors to the model device.
+
+        Parameters
+        ----------
+        apply_chat_template : bool
+            If ``True`` and the tokenizer supports it, wrap *text* in a
+            chat template before tokenizing.
+        """
+        if apply_chat_template:
+            text = self._format_prompt(text)
         return self.tokenizer(text, return_tensors="pt").to(self.device)
 
     def _get_residual_stream(
@@ -1150,7 +1186,7 @@ class DistributionalSemanticsTracer:
         -------
         DSTResult
         """
-        tokens = self._encode(prompt)
+        tokens = self._encode(prompt, apply_chat_template=True)
         seq_len = tokens["input_ids"].shape[1]
         if answer_pos is None:
             answer_pos = seq_len - 1
@@ -1214,7 +1250,7 @@ class DistributionalSemanticsTracer:
             do_sample=False,
         )
         generated_text = self.tokenizer.decode(
-            gen_ids[0, seq_len:], skip_special_tokens=True
+            gen_ids[0, seq_len:], skip_special_tokens=True,
         ).strip()
 
         # ---- Concept importance (aggregate score per layer) ----
@@ -1248,7 +1284,7 @@ class DistributionalSemanticsTracer:
 
         DSS = Σ correct_pathway_strength / (Σ correct + Σ incorrect + ε)
         """
-        tokens = self._encode(prompt)
+        tokens = self._encode(prompt, apply_chat_template=True)
         if layer_idx < 0:
             layer_idx = self.n_layers + layer_idx
         layer_name = self.layer_names[layer_idx]
