@@ -744,7 +744,7 @@ class DistributionalSemanticsTracer:
         return tids
 
     @torch.no_grad()
-    def compute_cas(
+    def compute_cas_probability(
         self,
         tokens: dict,
         answer_pos: int,
@@ -754,7 +754,7 @@ class DistributionalSemanticsTracer:
         K: int = 30,
     ) -> CASTrace:
         """
-        Eq. (6)–(7) — probability-based CAS:
+        **Probability-based CAS** (recommended for misalignment analysis):
 
             p^ℓ(v) = softmax(U · norm(h^ℓ))_v
 
@@ -831,8 +831,8 @@ class DistributionalSemanticsTracer:
 
         # Derive operational markers
         onset = self._find_onset(cas_values)
-        inversion = self._find_inversion(cas_values, threshold=0.8)
-        commitment = self._find_commitment(cas_values, inversion, threshold=0.5)
+        inversion = self._find_inversion(cas_values)
+        commitment = self._find_commitment(cas_values)
 
         return CASTrace(
             cas_values=cas_values,
@@ -841,12 +841,163 @@ class DistributionalSemanticsTracer:
             commitment_layer=commitment,
         )
 
+    @torch.no_grad()
+    def compute_cas_cosine(
+        self,
+        tokens: dict,
+        answer_pos: int,
+        context_words: List[str],
+        noncontext_words: List[str],
+        layers: Optional[List[int]] = None,
+        K: int = 30,
+    ) -> CASTrace:
+        """
+        **Cosine-similarity-based CAS** (original paper formulation):
+
+            a^ℓ(v) = cos(norm(h^ℓ), e(v))
+
+            CAS^ℓ = Σ_{v ∈ V_ctx} |a^ℓ(v)|
+                    / (Σ_{v ∈ V_ctx} |a^ℓ(v)| + Σ_{v ∈ V_nonctx} |a^ℓ(v)|)
+
+        Measures how much *information* about each word set is encoded
+        in the residual stream, regardless of prediction direction.
+        Useful for hallucination analysis where the question is "does
+        the model still encode the correct context?" rather than "which
+        answer will the model predict?".
+
+        Parameters
+        ----------
+        context_words    : words compatible with the *intended* interpretation.
+        noncontext_words : words compatible with the *competing* interpretation.
+        K : int
+            Unused (kept for API compatibility).
+        """
+        if layers is None:
+            layers = list(range(self.n_layers))
+
+        residuals = self._get_residual_stream(tokens, layers)
+
+        # Pre-compute embedding vectors for each word
+        ctx_embeddings: List[torch.Tensor] = []
+        for w in context_words:
+            try:
+                ctx_embeddings.append(self._get_word_embedding(w))
+            except ValueError:
+                warnings.warn(f"Skipping untokenizable context word: {w!r}")
+
+        nonctx_embeddings: List[torch.Tensor] = []
+        for w in noncontext_words:
+            try:
+                nonctx_embeddings.append(self._get_word_embedding(w))
+            except ValueError:
+                warnings.warn(
+                    f"Skipping untokenizable noncontext word: {w!r}"
+                )
+
+        if not ctx_embeddings and not nonctx_embeddings:
+            warnings.warn("No valid context/noncontext embeddings — CAS undefined.")
+            return CASTrace(
+                cas_values=[0.5] * len(layers),
+                onset_layer=None,
+                inversion_layer=None,
+                commitment_layer=None,
+            )
+
+        # Stack for vectorised cosine similarity
+        d = self._get_unembed_matrix().shape[1]
+        ctx_mat = (
+            torch.stack(ctx_embeddings)
+            if ctx_embeddings
+            else torch.zeros(0, d, device=self.device)
+        )
+        nonctx_mat = (
+            torch.stack(nonctx_embeddings)
+            if nonctx_embeddings
+            else torch.zeros(0, d, device=self.device)
+        )
+
+        cas_values: List[float] = []
+        for layer_idx in layers:
+            h_raw = residuals[layer_idx][0, answer_pos]  # (d,)
+            h = self._apply_final_norm(h_raw)              # project into unembed space
+            h_norm = F.normalize(h.unsqueeze(0), dim=-1)   # (1, d)
+
+            # Cosine affinities  a^ℓ(v) = cos(norm(h), e(v))
+            if ctx_mat.shape[0] > 0:
+                ctx_normed = F.normalize(ctx_mat, dim=-1)
+                ctx_cos = (h_norm @ ctx_normed.T).squeeze(0)
+                ctx_score = float(ctx_cos.abs().sum())
+            else:
+                ctx_score = 0.0
+
+            if nonctx_mat.shape[0] > 0:
+                nonctx_normed = F.normalize(nonctx_mat, dim=-1)
+                nonctx_cos = (h_norm @ nonctx_normed.T).squeeze(0)
+                nonctx_score = float(nonctx_cos.abs().sum())
+            else:
+                nonctx_score = 0.0
+
+            total = ctx_score + nonctx_score
+            cas = ctx_score / total if total > 0.0 else 0.5
+            cas_values.append(cas)
+
+        # Derive operational markers
+        onset = self._find_onset(cas_values)
+        inversion = self._find_inversion(cas_values)
+        commitment = self._find_commitment(cas_values)
+
+        return CASTrace(
+            cas_values=cas_values,
+            onset_layer=onset,
+            inversion_layer=inversion,
+            commitment_layer=commitment,
+        )
+
+    @torch.no_grad()
+    def compute_cas(
+        self,
+        tokens: dict,
+        answer_pos: int,
+        context_words: List[str],
+        noncontext_words: List[str],
+        layers: Optional[List[int]] = None,
+        K: int = 30,
+        method: str = "probability",
+    ) -> CASTrace:
+        """
+        Compute the Contextual Alignment Score across layers.
+
+        Parameters
+        ----------
+        method : str
+            ``"probability"`` — softmax-based CAS (default).  Recommended
+            for misalignment analysis where the question is "which answer
+            will the model produce?".
+
+            ``"cosine"`` — absolute-cosine-similarity CAS (original paper
+            formulation).  Useful for hallucination analysis where the
+            question is "does the model still encode the correct context?".
+
+        See ``compute_cas_probability`` and ``compute_cas_cosine`` for
+        full parameter documentation.
+        """
+        if method == "cosine":
+            return self.compute_cas_cosine(
+                tokens, answer_pos, context_words, noncontext_words,
+                layers=layers, K=K,
+            )
+        else:
+            return self.compute_cas_probability(
+                tokens, answer_pos, context_words, noncontext_words,
+                layers=layers, K=K,
+            )
+
     # ------------------------------------------------------------------
-    # Operational layer markers  (probability-based CAS, range [0, 1])
+    # Operational layer markers  (CAS range [0, 1])
     #
-    #   CAS > 0.5  →  context (safe) words dominate
-    #   CAS < 0.5  →  noncontext (unsafe) words dominate
-    #   CAS = 0.5  →  neutral
+    #   Onset      → early layers   (model starts forming a prediction)
+    #   Inversion  → middle layers  (steepest representational shift)
+    #   Commitment → late layers    (model locks in its final answer)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -856,10 +1007,11 @@ class DistributionalSemanticsTracer:
         window: int = 2,
     ) -> Optional[int]:
         """
-        **Prediction onset** (green dot):
-        Earliest layer where CAS begins a sustained *directional* change
-        (either rising or falling) — the model starts forming a
-        prediction.
+        **Prediction onset** (green dot) — *early layers*.
+
+        First layer where CAS begins a sustained directional change
+        (either rising or falling).  This marks the point where the
+        model starts distinguishing between word sets.
 
         Detected as the first layer where |CAS[i] − CAS[i−1]| exceeds
         *tolerance* and the direction persists for *window* subsequent
@@ -868,7 +1020,6 @@ class DistributionalSemanticsTracer:
         for i in range(1, len(cas)):
             delta = cas[i] - cas[i - 1]
             if abs(delta) > tolerance:
-                # Check that the next `window` layers continue the same direction
                 direction = 1 if delta > 0 else -1
                 sustained = all(
                     (cas[min(i + j, len(cas) - 1)] - cas[min(i + j - 1, len(cas) - 1)])
@@ -883,56 +1034,60 @@ class DistributionalSemanticsTracer:
     @staticmethod
     def _find_inversion(
         cas: List[float],
-        threshold: float = 0.5,
+        min_delta: float = 0.02,
     ) -> Optional[int]:
         """
-        **Semantic inversion** (yellow dot):
-        First layer where CAS crosses *below* 0.5 — the model flips from
-        predicting context words to predicting noncontext words.
+        **Semantic inversion** (yellow dot) — *middle layers*.
 
-        For an aligned model this may never occur (CAS stays above 0.5).
-        For a misaligned model this marks where the unsafe prediction
-        takes over.
+        Layer of maximum absolute CAS change rate — the steepest
+        transition point where the model's internal representation is
+        shifting most rapidly between competing interpretations.
+
+        This naturally falls in the middle of the network, between
+        onset (early) and commitment (late).
+
+        Parameters
+        ----------
+        min_delta : float
+            Minimum absolute derivative to count as a real transition
+            (filters out noise).
         """
-        for i, c in enumerate(cas):
-            if c < threshold:
-                return i
-        return None
+        if len(cas) < 2:
+            return None
+        max_delta = 0.0
+        inv_layer = None
+        for i in range(1, len(cas)):
+            delta = abs(cas[i] - cas[i - 1])
+            if delta > max_delta:
+                max_delta = delta
+                inv_layer = i
+        return inv_layer if max_delta > min_delta else None
 
     @staticmethod
     def _find_commitment(
         cas: List[float],
-        inversion: Optional[int],
-        threshold: float = 0.5,
-        min_persist: int = 3,
+        tolerance: float = 0.03,
     ) -> Optional[int]:
         """
-        **Commitment** (red dot):
-        First layer after which CAS stays on a *consistent side* of 0.5
-        through the remaining depth.  If inversion occurred, looks for
-        persistence below *threshold*; otherwise looks for persistence
-        above *threshold*.
+        **Commitment** (red dot) — *late layers*.
 
-        This marks the layer where the model has "locked in" its final
-        prediction direction.
+        Earliest layer from which CAS stays within *tolerance* of its
+        final value through the remaining depth.  Found by walking
+        *backwards* from the last layer.
+
+        This marks the point where the model has "locked in" its
+        final prediction and representation is no longer shifting.
         """
-        if inversion is not None:
-            # Model inverted → commitment = stays below threshold
-            for i in range(inversion, len(cas)):
-                remaining = cas[i:]
-                if len(remaining) >= min_persist and all(
-                    c < threshold for c in remaining[:min_persist]
-                ):
-                    return i
-        else:
-            # Model never inverted → commitment = stays above threshold
-            for i in range(len(cas)):
-                remaining = cas[i:]
-                if len(remaining) >= min_persist and all(
-                    c >= threshold for c in remaining[:min_persist]
-                ):
-                    return i
-        return None
+        if len(cas) < 2:
+            return None
+        final_val = cas[-1]
+        commitment = len(cas) - 1
+        for i in range(len(cas) - 1, -1, -1):
+            if abs(cas[i] - final_val) <= tolerance:
+                commitment = i
+            else:
+                break
+        return commitment
 
     # ==================================================================
     # Full analysis pipeline
@@ -951,6 +1106,7 @@ class DistributionalSemanticsTracer:
         ensure_tokens: Optional[List[int]] = None,
         corruption_token: Optional[int] = None,
         cas_layers: Optional[List[int]] = None,
+        cas_method: str = "probability",
         # Legacy compatibility parameters
         factual_prompt: Optional[str] = None,
         concept_examples: Optional[List[str]] = None,
@@ -986,6 +1142,9 @@ class DistributionalSemanticsTracer:
             Token id used for minimal corruption in Step 3.
         cas_layers : list of int, optional
             Layers over which to compute CAS (defaults to all layers).
+        cas_method : str
+            CAS computation method: ``"probability"`` (softmax-based,
+            default) or ``"cosine"`` (absolute cosine similarity).
 
         Returns
         -------
@@ -1035,6 +1194,7 @@ class DistributionalSemanticsTracer:
                 noncontext_words=noncontext_words,
                 layers=cas_layers,
                 K=K,
+                method=cas_method,
             )
 
         # ---- Next-token probabilities ----
