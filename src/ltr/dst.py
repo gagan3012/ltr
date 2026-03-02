@@ -116,6 +116,24 @@ class CASTrace:
 
 
 @dataclass
+class SequenceStepResult:
+    """Per-token analysis within a multi-token sequence prediction.
+
+    When DST is run with ``num_max_tokens > 1``, each generated token
+    produces one ``SequenceStepResult`` capturing its own semantic maps,
+    CAS trace, and next-token probabilities.
+    """
+    step: int                                #  0-based step index
+    token_id: int                            #  predicted token id at this step
+    token_word: str                          #  decoded surface form
+    token_prob: float                        #  probability assigned to this token
+    semantic_maps: Dict[int, SemanticMap]     #  layer → SemanticMap
+    cas_trace: CASTrace                      #  CAS across depth for this step
+    next_token_probs: Dict[str, float]       #  top-K probs at this step
+    concept_importance: Dict[int, float]     #  layer → aggregate node score
+
+
+@dataclass
 class DSTResult:
     """Container for complete DST analysis results."""
     semantic_maps: Dict[int, SemanticMap]    # layer → SemanticMap
@@ -123,6 +141,11 @@ class DSTResult:
     next_token_probs: Dict[str, float]       # word → probability at answer pos
     concept_importance: Dict[int, float]     # layer → aggregate node score
     generated_text: str = ""                  # greedy continuation from the model
+    # ---- Sequence prediction fields (num_max_tokens > 1) ----
+    sequence_steps: List[SequenceStepResult] = field(default_factory=list)
+    sequence_cas_trace: Optional[CASTrace] = None   # aggregated CAS over tokens
+    sequence_token_probs: List[Dict[str, float]] = field(default_factory=list)
+    num_max_tokens: int = 1                  # how many tokens were predicted
     # Legacy compatibility fields
     patched_representations: Dict[str, Any] = field(default_factory=dict)
     spurious_spans: List[Dict] = field(default_factory=list)
@@ -1143,6 +1166,7 @@ class DistributionalSemanticsTracer:
         corruption_token: Optional[int] = None,
         cas_layers: Optional[List[int]] = None,
         cas_method: str = "probability",
+        num_max_tokens: int = 1,
         # Legacy compatibility parameters
         factual_prompt: Optional[str] = None,
         concept_examples: Optional[List[str]] = None,
@@ -1181,11 +1205,36 @@ class DistributionalSemanticsTracer:
         cas_method : str
             CAS computation method: ``"probability"`` (softmax-based,
             default) or ``"cosine"`` (absolute cosine similarity).
+        num_max_tokens : int
+            Number of tokens to predict autoregressively.  When > 1 the
+            tracer generates a sequence of tokens, performs DST analysis
+            at each step, and aggregates CAS traces and semantic maps
+            across the full predicted sequence.  This makes the analysis
+            more relevant for multi-token answers (e.g. entity names,
+            phrases) because it captures how semantic alignment evolves
+            as the model commits to successive tokens.
 
         Returns
         -------
         DSTResult
         """
+        # Delegate to sequence analysis when predicting multiple tokens
+        if num_max_tokens > 1:
+            return self._run_sequence_analysis(
+                prompt=prompt,
+                context_words=context_words,
+                noncontext_words=noncontext_words,
+                answer_pos=answer_pos,
+                K=K,
+                map_layers=map_layers,
+                compute_edges=compute_edges,
+                ensure_tokens=ensure_tokens,
+                corruption_token=corruption_token,
+                cas_layers=cas_layers,
+                cas_method=cas_method,
+                num_max_tokens=num_max_tokens,
+            )
+
         tokens = self._encode(prompt, apply_chat_template=True)
         seq_len = tokens["input_ids"].shape[1]
         if answer_pos is None:
@@ -1265,6 +1314,241 @@ class DistributionalSemanticsTracer:
             next_token_probs=next_token_probs,
             concept_importance=concept_importance,
             generated_text=generated_text,
+        )
+
+    # ==================================================================
+    # Sequence prediction analysis  (num_max_tokens > 1)
+    # ==================================================================
+
+    @torch.no_grad()
+    def _run_sequence_analysis(
+        self,
+        prompt: str,
+        context_words: Optional[List[str]] = None,
+        noncontext_words: Optional[List[str]] = None,
+        answer_pos: Optional[int] = None,
+        K: int = 30,
+        map_layers: Optional[List[int]] = None,
+        compute_edges: bool = True,
+        ensure_tokens: Optional[List[int]] = None,
+        corruption_token: Optional[int] = None,
+        cas_layers: Optional[List[int]] = None,
+        cas_method: str = "probability",
+        num_max_tokens: int = 5,
+    ) -> DSTResult:
+        """
+        Autoregressive multi-token DST analysis.
+
+        For each of ``num_max_tokens`` generated tokens the method:
+
+        1. Runs a forward pass to obtain logits at the current answer
+           position.
+        2. Greedily selects the next token.
+        3. Builds semantic maps and computes the CAS trace at the
+           current answer position *before* committing the token.
+        4. Appends the predicted token to the input sequence and repeats.
+
+        After all steps, per-step CAS traces are aggregated into a
+        *sequence-level* CAS trace using probability-weighted averaging
+        (tokens the model is more confident about contribute more to
+        the aggregate).
+
+        The ``DSTResult.semantic_maps`` and ``cas_trace`` fields contain
+        the **first-step** results (compatible with single-token code),
+        while ``sequence_steps`` holds per-token details and
+        ``sequence_cas_trace`` holds the aggregated trace.
+        """
+        tokens = self._encode(prompt, apply_chat_template=True)
+
+        # Default map layers: ~6 evenly spaced
+        if map_layers is None:
+            n_maps = min(6, self.n_layers)
+            map_layers = np.linspace(
+                0, self.n_layers - 1, n_maps, dtype=int
+            ).tolist()
+
+        # Concept words for semantic maps
+        concept_words: Optional[List[str]] = None
+        if context_words or noncontext_words:
+            concept_words = list(context_words or []) + list(noncontext_words or [])
+
+        # Track current input ids (grows with each predicted token)
+        current_ids = tokens["input_ids"].clone()          # (1, seq_len)
+        current_mask = tokens.get("attention_mask")
+        if current_mask is not None:
+            current_mask = current_mask.clone()
+
+        sequence_steps: List[SequenceStepResult] = []
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        for step_idx in tqdm(
+            range(num_max_tokens),
+            desc=f"Sequence DST ({num_max_tokens} tokens)",
+        ):
+            step_tokens = {"input_ids": current_ids}
+            if current_mask is not None:
+                step_tokens["attention_mask"] = current_mask
+
+            cur_seq_len = current_ids.shape[1]
+            cur_answer_pos = cur_seq_len - 1
+
+            # ---- Semantic maps for this step ----
+            step_maps: Dict[int, SemanticMap] = {}
+            for l in map_layers:
+                sm = self.build_semantic_map(
+                    step_tokens,
+                    layer=l,
+                    answer_pos=cur_answer_pos,
+                    K=K,
+                    ensure_tokens=ensure_tokens,
+                    corruption_token=corruption_token,
+                    compute_edges=compute_edges,
+                    concept_words=concept_words,
+                )
+                step_maps[l] = sm
+
+            # ---- CAS trace for this step ----
+            step_cas = CASTrace(cas_values=[])
+            if context_words and noncontext_words:
+                step_cas = self.compute_cas(
+                    step_tokens,
+                    answer_pos=cur_answer_pos,
+                    context_words=context_words,
+                    noncontext_words=noncontext_words,
+                    layers=cas_layers,
+                    K=K,
+                    method=cas_method,
+                )
+
+            # ---- Next-token probabilities ----
+            logits = self._forward_logits(step_tokens)
+            probs = F.softmax(logits[0, cur_answer_pos], dim=-1)
+            topk_probs, topk_ids = torch.topk(probs, min(K, probs.shape[0]))
+            step_next_probs: Dict[str, float] = {}
+            for tid, p in zip(topk_ids.tolist(), topk_probs.tolist()):
+                word = self.tokenizer.decode([tid]).strip()
+                step_next_probs[word] = p
+
+            # ---- Greedy selection ----
+            next_token_id = int(probs.argmax().item())
+            next_token_word = self.tokenizer.decode(
+                [next_token_id], skip_special_tokens=True,
+            ).strip()
+            next_token_prob = float(probs[next_token_id].item())
+
+            # ---- Concept importance ----
+            step_importance: Dict[int, float] = {
+                l: sum(n.score for n in sm.nodes)
+                for l, sm in step_maps.items()
+            }
+
+            sequence_steps.append(
+                SequenceStepResult(
+                    step=step_idx,
+                    token_id=next_token_id,
+                    token_word=next_token_word,
+                    token_prob=next_token_prob,
+                    semantic_maps=step_maps,
+                    cas_trace=step_cas,
+                    next_token_probs=step_next_probs,
+                    concept_importance=step_importance,
+                )
+            )
+
+            # Stop early on EOS
+            if eos_id is not None and next_token_id == eos_id:
+                break
+
+            # ---- Append token and grow the sequence ----
+            next_id_tensor = torch.tensor(
+                [[next_token_id]], device=self.device
+            )
+            current_ids = torch.cat([current_ids, next_id_tensor], dim=1)
+            if current_mask is not None:
+                current_mask = torch.cat(
+                    [current_mask,
+                     torch.ones(1, 1, dtype=current_mask.dtype,
+                                device=self.device)],
+                    dim=1,
+                )
+
+        # ---- Aggregate results ----
+        # First step provides the primary (backward-compat) fields
+        first = sequence_steps[0]
+
+        # Generated text = concatenation of all predicted tokens
+        generated_text = "".join(
+            self.tokenizer.decode([s.token_id], skip_special_tokens=True)
+            for s in sequence_steps
+        ).strip()
+
+        # Aggregate CAS: probability-weighted average across steps
+        seq_cas = self._aggregate_sequence_cas(sequence_steps)
+
+        # Sequence-level token probabilities (list of dicts)
+        seq_token_probs = [s.next_token_probs for s in sequence_steps]
+
+        return DSTResult(
+            semantic_maps=first.semantic_maps,
+            cas_trace=first.cas_trace,
+            next_token_probs=first.next_token_probs,
+            concept_importance=first.concept_importance,
+            generated_text=generated_text,
+            sequence_steps=sequence_steps,
+            sequence_cas_trace=seq_cas,
+            sequence_token_probs=seq_token_probs,
+            num_max_tokens=num_max_tokens,
+        )
+
+    def _aggregate_sequence_cas(
+        self,
+        steps: List[SequenceStepResult],
+    ) -> CASTrace:
+        """
+        Aggregate per-step CAS traces into a single sequence-level
+        CAS trace using probability-weighted averaging.
+
+        For each layer *l*:
+
+            CAS_seq^l = Σ_t  p_t · CAS_t^l  /  Σ_t p_t
+
+        where *p_t* is the greedy probability of the token predicted at
+        step *t*.  This gives higher weight to tokens the model is more
+        confident about, producing a more representative alignment
+        signal than a simple average.
+
+        The operational-layer markers (onset, inversion, commitment) are
+        re-derived from the aggregated CAS curve.
+        """
+        # Filter steps that have valid CAS values
+        valid = [s for s in steps if s.cas_trace.cas_values]
+        if not valid:
+            return CASTrace(cas_values=[])
+
+        n_layers = len(valid[0].cas_trace.cas_values)
+        weighted_sum = np.zeros(n_layers, dtype=np.float64)
+        weight_total = 0.0
+
+        for s in valid:
+            cas_arr = np.array(s.cas_trace.cas_values[:n_layers])
+            w = s.token_prob
+            weighted_sum += w * cas_arr
+            weight_total += w
+
+        if weight_total < 1e-12:
+            avg_cas = [0.5] * n_layers
+        else:
+            avg_cas = (weighted_sum / weight_total).tolist()
+
+        onset = self._find_onset(avg_cas)
+        inversion = self._find_inversion(avg_cas)
+        commitment = self._find_commitment(avg_cas)
+
+        return CASTrace(
+            cas_values=avg_cas,
+            onset_layer=onset,
+            inversion_layer=inversion,
+            commitment_layer=commitment,
         )
 
     # ==================================================================
@@ -1612,6 +1896,221 @@ class DistributionalSemanticsTracer:
         ax.barh(words, vals, color="#74b9ff")
         ax.set_xlabel("Probability")
         ax.set_title("Next-token distribution at answer position")
+        return fig
+
+    # ------------------------------------------------------------------
+    # Sequence-level visualizations
+    # ------------------------------------------------------------------
+
+    def plot_sequence_cas_heatmap(
+        self,
+        result: DSTResult,
+        ax: Optional[plt.Axes] = None,
+        figsize: Tuple[int, int] = (12, 6),
+    ) -> plt.Figure:
+        """
+        Heatmap of CAS values with layers on the y-axis and predicted
+        tokens on the x-axis.  Each column shows the per-layer CAS
+        trace for one step in the autoregressive sequence.
+
+        Red indicates low CAS (competing interpretation dominates),
+        green indicates high CAS (context-consistent concepts dominate).
+        """
+        if not result.sequence_steps:
+            raise ValueError(
+                "No sequence steps — run analysis with num_max_tokens > 1"
+            )
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        # Build matrix  (n_layers, n_steps)
+        steps = result.sequence_steps
+        valid = [s for s in steps if s.cas_trace.cas_values]
+        if not valid:
+            ax.text(0.5, 0.5, "No CAS data", ha="center", va="center")
+            ax.axis("off")
+            return fig
+
+        n_layers = len(valid[0].cas_trace.cas_values)
+        matrix = np.zeros((n_layers, len(valid)))
+        x_labels = []
+        for j, s in enumerate(valid):
+            cas_vals = s.cas_trace.cas_values[:n_layers]
+            matrix[:, j] = cas_vals
+            label = s.token_word if s.token_word else f"t{s.step}"
+            x_labels.append(f"{label}\n(p={s.token_prob:.2f})")
+
+        im = ax.imshow(
+            matrix, aspect="auto", cmap="RdYlGn",
+            vmin=0, vmax=1, origin="lower",
+        )
+        ax.set_xticks(range(len(x_labels)))
+        ax.set_xticklabels(x_labels, fontsize=8)
+        ax.set_xlabel("Predicted token (step)")
+        ax.set_ylabel("Layer")
+        ax.set_title("Per-token CAS across layers")
+        fig.colorbar(im, ax=ax, label="CAS")
+        return fig
+
+    def plot_sequence_cas_overlay(
+        self,
+        result: DSTResult,
+        ax: Optional[plt.Axes] = None,
+        figsize: Tuple[int, int] = (10, 5),
+    ) -> plt.Figure:
+        """
+        Overlay per-step CAS traces and the aggregated sequence CAS
+        on a single axis.  Individual steps are drawn as thin faded
+        lines; the aggregated trace is drawn as a thick solid line.
+        """
+        if not result.sequence_steps:
+            raise ValueError(
+                "No sequence steps — run analysis with num_max_tokens > 1"
+            )
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        valid = [s for s in result.sequence_steps if s.cas_trace.cas_values]
+        if not valid:
+            ax.text(0.5, 0.5, "No CAS data", ha="center", va="center")
+            ax.axis("off")
+            return fig
+
+        n_layers = len(valid[0].cas_trace.cas_values)
+        layers = list(range(n_layers))
+
+        for s in valid:
+            label = s.token_word if s.token_word else f"t{s.step}"
+            ax.plot(
+                layers, s.cas_trace.cas_values[:n_layers],
+                alpha=0.3, linewidth=1, label=f"step {s.step}: {label}",
+            )
+
+        # Aggregated CAS
+        if result.sequence_cas_trace and result.sequence_cas_trace.cas_values:
+            ax.plot(
+                layers,
+                result.sequence_cas_trace.cas_values[:n_layers],
+                color="#2d3436", linewidth=2.5,
+                label="Aggregated (weighted)",
+            )
+            # Markers
+            cas = result.sequence_cas_trace
+            if cas.onset_layer is not None:
+                ax.plot(
+                    cas.onset_layer, cas.cas_values[cas.onset_layer],
+                    "o", color="green", markersize=10,
+                    label="Onset", zorder=5,
+                )
+            if cas.inversion_layer is not None:
+                ax.plot(
+                    cas.inversion_layer, cas.cas_values[cas.inversion_layer],
+                    "o", color="#f1c40f", markersize=10,
+                    label="Inversion", zorder=5,
+                )
+            if cas.commitment_layer is not None:
+                ax.plot(
+                    cas.commitment_layer, cas.cas_values[cas.commitment_layer],
+                    "o", color="red", markersize=10,
+                    label="Commitment", zorder=5,
+                )
+
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("CAS")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title("Sequence CAS across depth (per-token & aggregated)")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(True, alpha=0.3)
+        return fig
+
+    def plot_sequence_token_confidence(
+        self,
+        result: DSTResult,
+        ax: Optional[plt.Axes] = None,
+        figsize: Tuple[int, int] = (10, 4),
+    ) -> plt.Figure:
+        """
+        Bar chart of per-token confidence (greedy probability) across
+        the predicted sequence.  Useful for spotting where the model
+        becomes uncertain during multi-token generation.
+        """
+        if not result.sequence_steps:
+            raise ValueError(
+                "No sequence steps — run analysis with num_max_tokens > 1"
+            )
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        labels = []
+        probs = []
+        for s in result.sequence_steps:
+            word = s.token_word if s.token_word else f"t{s.step}"
+            labels.append(word)
+            probs.append(s.token_prob)
+
+        colors = [
+            "#27ae60" if p > 0.5 else "#f39c12" if p > 0.2 else "#e74c3c"
+            for p in probs
+        ]
+        ax.bar(range(len(labels)), probs, color=colors, edgecolor="white")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=9, rotation=30, ha="right")
+        ax.set_ylabel("Probability")
+        ax.set_title("Per-token confidence in predicted sequence")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3, axis="y")
+        return fig
+
+    def plot_sequence_summary(
+        self,
+        result: DSTResult,
+        context_words: Optional[List[str]] = None,
+        noncontext_words: Optional[List[str]] = None,
+        figsize: Tuple[int, int] = (18, 14),
+    ) -> plt.Figure:
+        """
+        Combined multi-panel summary for sequence prediction:
+
+        - Top-left:  Aggregated CAS trace with markers.
+        - Top-right: Per-token confidence bar chart.
+        - Bottom:    CAS heatmap (layers × tokens).
+        """
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.2])
+
+        # Aggregated CAS
+        ax_cas = fig.add_subplot(gs[0, 0])
+        if (
+            result.sequence_cas_trace
+            and result.sequence_cas_trace.cas_values
+        ):
+            self.plot_cas_trace(result.sequence_cas_trace, ax=ax_cas)
+            ax_cas.set_title("Aggregated Sequence CAS")
+        else:
+            self.plot_cas_trace(result.cas_trace, ax=ax_cas)
+
+        # Token confidence
+        ax_conf = fig.add_subplot(gs[0, 1])
+        if result.sequence_steps:
+            self.plot_sequence_token_confidence(result, ax=ax_conf)
+
+        # CAS heatmap
+        ax_heat = fig.add_subplot(gs[1, :])
+        if result.sequence_steps:
+            self.plot_sequence_cas_heatmap(result, ax=ax_heat)
+
+        fig.suptitle(
+            f"Sequence DST Summary — "
+            f"\"{result.generated_text}\"",
+            fontsize=13, y=1.01,
+        )
+        fig.tight_layout()
         return fig
 
     # ------------------------------------------------------------------

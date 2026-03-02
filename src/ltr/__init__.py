@@ -82,6 +82,7 @@ from ltr.dst import (
     SemanticMapNode,
     SemanticMapEdge,
     CASTrace,
+    SequenceStepResult,
 )
 
 # Define public API
@@ -132,6 +133,7 @@ __all__ = [
 
     'DistributionalSemanticsTracer', 'DSTResult',
     'SemanticMap', 'SemanticMapNode', 'SemanticMapEdge', 'CASTrace',
+    'SequenceStepResult',
 ]
 
 __version__ = "0.2.0"
